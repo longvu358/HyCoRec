@@ -1,0 +1,11 @@
+**/.omc
+log/
+__pycache__/
+*.pyc
+HyCoRec/data/
+
+uv.lock
+
+polarity_labels
+
+UniCRS
