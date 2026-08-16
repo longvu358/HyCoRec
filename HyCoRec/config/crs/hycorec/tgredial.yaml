@@ -35,7 +35,7 @@ rec:
   impatience: 2
   optimizer:
     name: Adam
-    lr: !!float 1e-3
+    lr: !!float 5e-4
 conv:
   epoch: 1
   batch_size: 128

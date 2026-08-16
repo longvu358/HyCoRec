@@ -1,5 +1,5 @@
 import json
-import pickle
+
 from tqdm import tqdm
 
 DATA_ROOT = "data/dataset/tgredial/pkuseg"
@@ -7,7 +7,7 @@ DATA_ROOT = "data/dataset/tgredial/pkuseg"
 def get_side_data():
     side_data = []
     with open(f"{DATA_ROOT}/cn-dbpedia.txt", "r", encoding="utf-8") as file:
-        for line in file.readlines():
+        for line in file:
             [a, _, b] = line.split("\t")
             b = b[:-1] if b[-1] == "\n" else b
             side_data.append((a, b))

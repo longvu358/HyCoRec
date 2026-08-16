@@ -1,5 +1,5 @@
 import json
-import pickle
+
 from tqdm import tqdm
 
 DATA_ROOT = "data/dataset/redial/nltk"
