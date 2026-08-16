@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from crslab.config import DATASET_PATH
 from crslab.data.dataset.base import BaseDataset
-from .resources import resources
+from crslab.data.dataset.hredial.resources import resources
 
 
 class HReDialDataset(BaseDataset):
@@ -77,32 +77,46 @@ class HReDialDataset(BaseDataset):
         self._load_other_data()
 
         vocab = {
-            'tok2ind': self.tok2ind,
-            'ind2tok': self.ind2tok,
-            'entity2id': self.entity2id,
-            'id2entity': self.id2entity,
-            'vocab_size': len(self.tok2ind),
-            'n_entity': self.n_entity
+            "tok2ind": self.tok2ind,
+            "ind2tok": self.ind2tok,
+            "entity2id": self.entity2id,
+            "id2entity": self.id2entity,
+            "vocab_size": len(self.tok2ind),
+            "n_entity": self.n_entity,
         }
 
         return train_data, valid_data, test_data, vocab
 
     def _load_raw_data(self):
         # load train/valid/test data
-        with open(os.path.join(self.dpath, 'train_data.json'), 'r', encoding='utf-8') as f:
+        with open(
+            os.path.join(self.dpath, "train_data.json"), "r", encoding="utf-8"
+        ) as f:
             train_data = json.load(f)
-            logger.debug(f"[Load train data from {os.path.join(self.dpath, 'train_data.json')}]")
-        with open(os.path.join(self.dpath, 'valid_data.json'), 'r', encoding='utf-8') as f:
+            logger.debug(
+                f"[Load train data from {os.path.join(self.dpath, 'train_data.json')}]"
+            )
+        with open(
+            os.path.join(self.dpath, "valid_data.json"), "r", encoding="utf-8"
+        ) as f:
             valid_data = json.load(f)
-            logger.debug(f"[Load valid data from {os.path.join(self.dpath, 'valid_data.json')}]")
-        with open(os.path.join(self.dpath, 'test_data.json'), 'r', encoding='utf-8') as f:
+            logger.debug(
+                f"[Load valid data from {os.path.join(self.dpath, 'valid_data.json')}]"
+            )
+        with open(
+            os.path.join(self.dpath, "test_data.json"), "r", encoding="utf-8"
+        ) as f:
             test_data = json.load(f)
-            logger.debug(f"[Load test data from {os.path.join(self.dpath, 'test_data.json')}]")
+            logger.debug(
+                f"[Load test data from {os.path.join(self.dpath, 'test_data.json')}]"
+            )
 
         return train_data, valid_data, test_data
 
     def _load_vocab(self):
-        self.tok2ind = json.load(open(os.path.join(self.dpath, 'token2id.json'), 'r', encoding='utf-8'))
+        self.tok2ind = json.load(
+            open(os.path.join(self.dpath, "token2id.json"), "r", encoding="utf-8")
+        )
         self.ind2tok = {idx: word for word, idx in self.tok2ind.items()}
 
         logger.debug(f"[Load vocab from {os.path.join(self.dpath, 'token2id.json')}]")
@@ -111,15 +125,19 @@ class HReDialDataset(BaseDataset):
 
     def _load_other_data(self):
         # edge extension data
-        self.conv2items = json.load(open(os.path.join(self.dpath, 'conv2items.json'), 'r', encoding='utf-8'))
+        self.conv2items = json.load(
+            open(os.path.join(self.dpath, "conv2items.json"), "r", encoding="utf-8")
+        )
         # dbpedia
         self.entity2id = json.load(
-            open(os.path.join(self.dpath, 'entity2id.json'), 'r', encoding='utf-8'))  # {entity: entity_id}
+            open(os.path.join(self.dpath, "entity2id.json"), "r", encoding="utf-8")
+        )  # {entity: entity_id}
         self.id2entity = {idx: entity for entity, idx in self.entity2id.items()}
         self.n_entity = max(self.entity2id.values()) + 1
-        self.side_data = pkl.load(open(os.path.join(self.dpath, 'side_data.pkl'), 'rb'))
+        self.side_data = pkl.load(open(os.path.join(self.dpath, "side_data.pkl"), "rb"))
         logger.debug(
-            f"[Load entity dictionary and KG from {os.path.join(self.dpath, 'entity2id.json')} and {os.path.join(self.dpath, 'dbpedia_subkg.json')}]")
+            f"[Load entity dictionary and KG from {os.path.join(self.dpath, 'entity2id.json')} and {os.path.join(self.dpath, 'dbpedia_subkg.json')}]"
+        )
 
     def _data_preprocess(self, train_data, valid_data, test_data):
         processed_train_data = self._raw_data_process(train_data)
@@ -130,10 +148,17 @@ class HReDialDataset(BaseDataset):
         logger.debug("[Finish test data process]")
         processed_side_data = self.side_data
         logger.debug("[Finish side data process]")
-        return processed_train_data, processed_valid_data, processed_test_data, processed_side_data
+        return (
+            processed_train_data,
+            processed_valid_data,
+            processed_test_data,
+            processed_side_data,
+        )
 
     def _raw_data_process(self, raw_data):
-        augmented_convs = [self._convert_to_id(conv) for convs in tqdm(raw_data) for conv in convs]
+        augmented_convs = [
+            self._convert_to_id(conv) for convs in tqdm(raw_data) for conv in convs
+        ]
         augmented_conv_dicts = []
         for conv in tqdm(augmented_convs):
             augmented_conv_dicts.extend(self._augment_and_add(conv))
@@ -147,12 +172,24 @@ class HReDialDataset(BaseDataset):
         related_item = []
         related_entity = []
         related_word = []
-        for utt in conversation['dialog']:
+        for utt in conversation["dialog"]:
             self.unk_token_idx = 3
-            text_token_ids = [self.tok2ind.get(word, self.unk_token_idx) for word in utt["text"]]
-            item_ids = [self.entity2id[movie] for movie in utt['movies'] if movie in self.entity2id]
-            entity_ids = [self.entity2id[entity] for entity in utt['entity'] if entity in self.entity2id]
-            word_ids = [self.tok2ind[word] for word in utt['text'] if word in self.tok2ind]
+            text_token_ids = [
+                self.tok2ind.get(word, self.unk_token_idx) for word in utt["text"]
+            ]
+            item_ids = [
+                self.entity2id[movie]
+                for movie in utt["movies"]
+                if movie in self.entity2id
+            ]
+            entity_ids = [
+                self.entity2id[entity]
+                for entity in utt["entity"]
+                if entity in self.entity2id
+            ]
+            word_ids = [
+                self.tok2ind[word] for word in utt["text"] if word in self.tok2ind
+            ]
 
             related_item += item_ids
             related_entity += entity_ids
@@ -164,14 +201,16 @@ class HReDialDataset(BaseDataset):
                 augmented_convs[-1]["entity"] += entity_ids
                 augmented_convs[-1]["word"] += word_ids
             else:
-                augmented_convs.append({
-                    "conv_id": conv_id,
-                    "role": utt["role"],
-                    "text": text_token_ids,
-                    "item": related_item,
-                    "entity": related_entity,
-                    "word": related_word
-                })
+                augmented_convs.append(
+                    {
+                        "conv_id": conv_id,
+                        "role": utt["role"],
+                        "text": text_token_ids,
+                        "item": related_item,
+                        "entity": related_entity,
+                        "word": related_word,
+                    }
+                )
             last_role = utt["role"]
 
         return augmented_convs
@@ -179,31 +218,29 @@ class HReDialDataset(BaseDataset):
     def _augment_and_add(self, raw_conv_dict):
         augmented_conv_dicts = []
         context_tokens, context_entities, context_words, context_items = [], [], [], []
-        entity_set, word_set = set(), set()
         for i, conv in enumerate(raw_conv_dict):
-            text_tokens, entities, movies, words = conv["text"], conv["entity"], conv["item"], conv["word"]
+            text_tokens, entities, movies, words = (
+                conv["text"],
+                conv["entity"],
+                conv["item"],
+                conv["word"],
+            )
             if len(context_tokens) > 0:
                 conv_dict = {
                     "conv_id": conv["conv_id"],
                     "role": conv["role"],
-                    "tokens": context_tokens,
+                    "tokens": copy(context_tokens),
                     "response": text_tokens,
-                    "item": context_items,
-                    "entity": context_entities,
-                    "word": context_words,
-                    "items": movies
+                    "item": copy(context_items),
+                    "entity": copy(context_entities),
+                    "word": copy(context_words),
+                    "items": movies,
                 }
                 augmented_conv_dicts.append(conv_dict)
 
             context_tokens.append(text_tokens)
-            context_items += movies
-            for entity in entities + movies:
-                if entity not in entity_set:
-                    entity_set.add(entity)
-                    context_entities.append(entity)
-            for word in words:
-                if word not in word_set:
-                    word_set.add(word)
-                    context_words.append(word)
+            context_items.append(movies)
+            context_entities.append(entities + movies)
+            context_words.append(words)
 
         return augmented_conv_dicts
