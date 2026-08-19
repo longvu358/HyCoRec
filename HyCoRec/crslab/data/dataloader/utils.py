@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 # @Time    :   2020/12/10
 # @Author  :   Xiaolei Wang
 # @email   :   wxl1999@foxmail.com
@@ -17,14 +16,13 @@
 from copy import copy
 
 import torch
-from typing import List, Union, Optional
 
 
 def padded_tensor(
-    items: List[Union[List[int], torch.LongTensor]],
+    items: list[list[int] | torch.LongTensor],
     pad_idx: int = 0,
     pad_tail: bool = True,
-    max_len: Optional[int] = None,
+    max_len: int | None = None,
 ) -> torch.LongTensor:
     """Create a padded matrix from an uneven list of lists.
 
@@ -47,7 +45,7 @@ def padded_tensor(
     # number of items
     n = len(items)
     # length of each item
-    lens: List[int] = [len(item) for item in items]  # type: ignore
+    lens: list[int] = [len(item) for item in items]  # type: ignore
     # max in time dimension
     t = max(lens) if max_len is None else max_len
     # if input tensors are empty, we should expand to nulls
