@@ -7,12 +7,31 @@
 # @Author : Kun Zhou, Xiaolei Wang
 # @Email  : francis_kun_zhou@163.com, wxl1999@foxmail.com
 
-import random
+import os
 from abc import ABC
-
-from loguru import logger
 from math import ceil
+
+import torch
+from loguru import logger
+from torch.utils.data import DataLoader as TorchDataLoader
+from torch.utils.data import Dataset as TorchDataset
 from tqdm import tqdm
+
+
+class _SequenceDataset(TorchDataset):
+    """Thin ``torch.utils.data.Dataset`` wrapper around an in-memory list,
+    so that batching/shuffling/(optionally) parallel prefetching can be
+    delegated to ``torch.utils.data.DataLoader`` instead of a hand-rolled
+    python loop."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
 
 
 class BaseDataLoader(ABC):
@@ -20,6 +39,11 @@ class BaseDataLoader(ABC):
 
     Notes:
         ``'scale'`` can be set in config to limit the size of dataset.
+
+        ``'num_workers'`` and ``'pin_memory'`` can be set in config to tune
+        ``torch.utils.data.DataLoader`` prefetching; they default to ``0``
+        (single-process, matching the historical behavior) and to whether
+        CUDA is available, respectively.
 
     """
 
@@ -34,6 +58,22 @@ class BaseDataLoader(ABC):
         self.dataset = dataset
         self.scale = opt.get("scale", 1)
         assert 0 < self.scale <= 1
+        self.num_workers = opt.get("num_workers", os.cpu_count())
+        self.pin_memory = opt.get("pin_memory", torch.cuda.is_available())
+        # process_fn (e.g. rec_process_fn/conv_process_fn) is a deterministic
+        # function of self.dataset, but get_data is invoked once per epoch.
+        # Cache its (scaled) output per underlying function so the whole
+        # dataset isn't rescanned/rebuilt every epoch.
+        self._processed_cache = {}
+
+    def _get_processed_dataset(self, process_fn):
+        dataset = self.dataset if process_fn is None else None
+        key = getattr(process_fn, "__func__", process_fn)
+        if key not in self._processed_cache:
+            if process_fn is not None:
+                dataset = process_fn()
+            self._processed_cache[key] = dataset[: ceil(len(dataset) * self.scale)]
+        return self._processed_cache[key]
 
     def get_data(self, batch_fn, batch_size, shuffle=True, process_fn=None):
         """Collate batch data for system to fit
@@ -48,26 +88,22 @@ class BaseDataLoader(ABC):
             tuple or dict of torch.Tensor: batch data for system to fit
 
         """
-        dataset = self.dataset
-        if process_fn is not None:
-            dataset = process_fn()
-            # logger.info('[Finish dataset process before batchify]')
-        dataset = dataset[: ceil(len(dataset) * self.scale)]
+        dataset = self._get_processed_dataset(process_fn)
         logger.debug(f"[Dataset size: {len(dataset)}]")
 
-        batch_num = ceil(len(dataset) / batch_size)
-        idx_list = list(range(len(dataset)))
-        if shuffle:
-            random.shuffle(idx_list)
+        loader = TorchDataLoader(
+            _SequenceDataset(dataset),
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=batch_fn,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+        )
 
-        for start_idx in tqdm(range(batch_num)):
-            batch_idx = idx_list[start_idx * batch_size : (start_idx + 1) * batch_size]
-            batch = [dataset[idx] for idx in batch_idx]
-            batch = batch_fn(batch)
-            if batch == False:
+        for batch in tqdm(loader, total=len(loader)):
+            if batch is False:
                 continue
             else:
-                # print(batch)
                 yield (batch)
 
     def get_conv_data(self, batch_size, shuffle=True):
@@ -203,7 +239,6 @@ class BaseDataLoader(ABC):
         Returns:
             data for system to recommend.
         """
-        pass
 
     def conv_interact(self, data):
         """Process user input data for system to converse.
@@ -214,4 +249,3 @@ class BaseDataLoader(ABC):
         Returns:
             data for system in converse.
         """
-        pass
