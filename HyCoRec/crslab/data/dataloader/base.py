@@ -32,7 +32,7 @@ class BaseDataLoader(ABC):
         """
         self.opt = opt
         self.dataset = dataset
-        self.scale = opt.get('scale', 1)
+        self.scale = opt.get("scale", 1)
         assert 0 < self.scale <= 1
 
     def get_data(self, batch_fn, batch_size, shuffle=True, process_fn=None):
@@ -52,8 +52,8 @@ class BaseDataLoader(ABC):
         if process_fn is not None:
             dataset = process_fn()
             # logger.info('[Finish dataset process before batchify]')
-        dataset = dataset[:ceil(len(dataset) * self.scale)]
-        logger.debug(f'[Dataset size: {len(dataset)}]')
+        dataset = dataset[: ceil(len(dataset) * self.scale)]
+        logger.debug(f"[Dataset size: {len(dataset)}]")
 
         batch_num = ceil(len(dataset) / batch_size)
         idx_list = list(range(len(dataset)))
@@ -61,14 +61,14 @@ class BaseDataLoader(ABC):
             random.shuffle(idx_list)
 
         for start_idx in tqdm(range(batch_num)):
-            batch_idx = idx_list[start_idx * batch_size: (start_idx + 1) * batch_size]
+            batch_idx = idx_list[start_idx * batch_size : (start_idx + 1) * batch_size]
             batch = [dataset[idx] for idx in batch_idx]
             batch = batch_fn(batch)
             if batch == False:
                 continue
             else:
                 # print(batch)
-                yield(batch) 
+                yield (batch)
 
     def get_conv_data(self, batch_size, shuffle=True):
         """get_data wrapper for conversation.
@@ -83,7 +83,9 @@ class BaseDataLoader(ABC):
             tuple or dict of torch.Tensor: batch data for conversation.
 
         """
-        return self.get_data(self.conv_batchify, batch_size, shuffle, self.conv_process_fn)
+        return self.get_data(
+            self.conv_batchify, batch_size, shuffle, self.conv_process_fn
+        )
 
     def get_rec_data(self, batch_size, shuffle=True):
         """get_data wrapper for recommendation.
@@ -98,7 +100,9 @@ class BaseDataLoader(ABC):
             tuple or dict of torch.Tensor: batch data for recommendation.
 
         """
-        return self.get_data(self.rec_batchify, batch_size, shuffle, self.rec_process_fn)
+        return self.get_data(
+            self.rec_batchify, batch_size, shuffle, self.rec_process_fn
+        )
 
     def get_policy_data(self, batch_size, shuffle=True):
         """get_data wrapper for policy.
@@ -113,7 +117,9 @@ class BaseDataLoader(ABC):
             tuple or dict of torch.Tensor: batch data for policy.
 
         """
-        return self.get_data(self.policy_batchify, batch_size, shuffle, self.policy_process_fn)
+        return self.get_data(
+            self.policy_batchify, batch_size, shuffle, self.policy_process_fn
+        )
 
     def conv_process_fn(self):
         """Process whole data for conversation before batch_fn.
@@ -133,7 +139,7 @@ class BaseDataLoader(ABC):
         Returns:
             batch data for the system to train conversation part.
         """
-        raise NotImplementedError('dataloader must implement conv_batchify() method')
+        raise NotImplementedError("dataloader must implement conv_batchify() method")
 
     def rec_process_fn(self):
         """Process whole data for recommendation before batch_fn.
@@ -153,7 +159,7 @@ class BaseDataLoader(ABC):
         Returns:
             batch data for the system to train recommendation part.
         """
-        raise NotImplementedError('dataloader must implement rec_batchify() method')
+        raise NotImplementedError("dataloader must implement rec_batchify() method")
 
     def policy_process_fn(self):
         """Process whole data for policy before batch_fn.
@@ -173,7 +179,7 @@ class BaseDataLoader(ABC):
         Returns:
             batch data for the system to train policy part.
         """
-        raise NotImplementedError('dataloader must implement policy_batchify() method')
+        raise NotImplementedError("dataloader must implement policy_batchify() method")
 
     def retain_recommender_target(self):
         """keep data whose role is recommender.
@@ -184,7 +190,7 @@ class BaseDataLoader(ABC):
         """
         dataset = []
         for conv_dict in tqdm(self.dataset):
-            if conv_dict['role'] == 'Recommender':
+            if conv_dict["role"] == "Recommender":
                 dataset.append(conv_dict)
         return dataset
 

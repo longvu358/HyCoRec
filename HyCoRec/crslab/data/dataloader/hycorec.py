@@ -8,7 +8,12 @@ import torch
 from tqdm import tqdm
 
 from crslab.data.dataloader.base import BaseDataLoader
-from crslab.data.dataloader.utils import add_start_end_token_idx, padded_tensor, truncate, merge_utt
+from crslab.data.dataloader.utils import (
+    add_start_end_token_idx,
+    padded_tensor,
+    truncate,
+    merge_utt,
+)
 
 
 class HyCoRecDataLoader(BaseDataLoader):
@@ -90,12 +95,24 @@ class HyCoRecDataLoader(BaseDataLoader):
         augment_dataset = []
         for conv_dict in tqdm(self.dataset):
             if conv_dict["role"] == "Recommender":
-                related_item = self._global_related(conv_dict, "item_global", "item", dedup=False)
-                related_entity = self._global_related(conv_dict, "entity_global", "entity", dedup=True)
-                related_word = self._global_related(conv_dict, "word_global", "word", dedup=True)
-                related_item_local = self._flatten_turns(conv_dict["item"], k=self.hyperedge_window_k, dedup=False)
-                related_entity_local = self._flatten_turns(conv_dict["entity"], k=self.hyperedge_window_k)
-                related_word_local = self._flatten_turns(conv_dict["word"], k=self.hyperedge_window_k)
+                related_item = self._global_related(
+                    conv_dict, "item_global", "item", dedup=False
+                )
+                related_entity = self._global_related(
+                    conv_dict, "entity_global", "entity", dedup=True
+                )
+                related_word = self._global_related(
+                    conv_dict, "word_global", "word", dedup=True
+                )
+                related_item_local = self._flatten_turns(
+                    conv_dict["item"], k=self.hyperedge_window_k, dedup=False
+                )
+                related_entity_local = self._flatten_turns(
+                    conv_dict["entity"], k=self.hyperedge_window_k
+                )
+                related_word_local = self._flatten_turns(
+                    conv_dict["word"], k=self.hyperedge_window_k
+                )
                 for item in conv_dict["items"]:
                     augment_conv_dict = {
                         "conv_id": conv_dict["conv_id"],
@@ -161,33 +178,60 @@ class HyCoRecDataLoader(BaseDataLoader):
         batch_conv_id = []
         for conv_dict in batch:
             batch_related_tokens.append(
-                truncate(conv_dict["tokens"][-1], self.related_truncate, truncate_tail=False)
+                truncate(
+                    conv_dict["tokens"][-1], self.related_truncate, truncate_tail=False
+                )
             )
             batch_context_tokens.append(
-                truncate(merge_utt(
-                    conv_dict["tokens"],
-                    start_token_idx=self.start_token_idx,
-                    split_token_idx=self.split_token_idx,
-                    final_token_idx=self.end_token_idx
-                ), self.context_truncate, truncate_tail=False)
+                truncate(
+                    merge_utt(
+                        conv_dict["tokens"],
+                        start_token_idx=self.start_token_idx,
+                        split_token_idx=self.split_token_idx,
+                        final_token_idx=self.end_token_idx,
+                    ),
+                    self.context_truncate,
+                    truncate_tail=False,
+                )
             )
 
-            batch_related_item.append(self._global_related(conv_dict, "item_global", "item", dedup=False))
-            batch_related_entity.append(self._global_related(conv_dict, "entity_global", "entity", dedup=True))
-            batch_related_word.append(self._global_related(conv_dict, "word_global", "word", dedup=True))
-            batch_related_item_local.append(self._flatten_turns(conv_dict["item"], k=self.hyperedge_window_k, dedup=False))
-            batch_related_entity_local.append(self._flatten_turns(conv_dict["entity"], k=self.hyperedge_window_k))
-            batch_related_word_local.append(self._flatten_turns(conv_dict["word"], k=self.hyperedge_window_k))
+            batch_related_item.append(
+                self._global_related(conv_dict, "item_global", "item", dedup=False)
+            )
+            batch_related_entity.append(
+                self._global_related(conv_dict, "entity_global", "entity", dedup=True)
+            )
+            batch_related_word.append(
+                self._global_related(conv_dict, "word_global", "word", dedup=True)
+            )
+            batch_related_item_local.append(
+                self._flatten_turns(
+                    conv_dict["item"], k=self.hyperedge_window_k, dedup=False
+                )
+            )
+            batch_related_entity_local.append(
+                self._flatten_turns(conv_dict["entity"], k=self.hyperedge_window_k)
+            )
+            batch_related_word_local.append(
+                self._flatten_turns(conv_dict["word"], k=self.hyperedge_window_k)
+            )
 
             batch_response.append(
-                add_start_end_token_idx(truncate(conv_dict["response"], self.response_truncate - 2),
-                                        start_token_idx=self.start_token_idx,
-                                        end_token_idx=self.end_token_idx))
+                add_start_end_token_idx(
+                    truncate(conv_dict["response"], self.response_truncate - 2),
+                    start_token_idx=self.start_token_idx,
+                    end_token_idx=self.end_token_idx,
+                )
+            )
             batch_conv_id.append(conv_dict["conv_id"])
 
         res = {
-            "related_tokens": padded_tensor(batch_related_tokens, self.pad_token_idx, pad_tail=False),
-            "context_tokens": padded_tensor(batch_context_tokens, self.pad_token_idx, pad_tail=False),
+            "related_tokens": padded_tensor(
+                batch_related_tokens, self.pad_token_idx, pad_tail=False
+            ),
+            "context_tokens": padded_tensor(
+                batch_context_tokens, self.pad_token_idx, pad_tail=False
+            ),
             "related_item": batch_related_item,
             "related_entity": batch_related_entity,
             "related_word": batch_related_word,
