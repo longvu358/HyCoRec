@@ -1,18 +1,16 @@
-# -*- encoding: utf-8 -*-
 # @Time    :   2021/5/26
 # @Author  :   Chenzhan Shang
 # @email   :   czshang@outlook.com
 
-import pickle
 import torch
 from tqdm import tqdm
 
 from crslab.data.dataloader.base import BaseDataLoader
 from crslab.data.dataloader.utils import (
     add_start_end_token_idx,
+    merge_utt,
     padded_tensor,
     truncate,
-    merge_utt,
 )
 
 
@@ -57,7 +55,6 @@ class HyCoRecDataLoader(BaseDataLoader):
         self.entity_truncate = opt.get("entity_truncate", None)
         self.hyperedge_window_k = opt.get("hyperedge_window_k", None)
         self.review_entity2id = vocab["entity2id"]
-        return
 
     @staticmethod
     def _flatten_turns(turns, k=None, dedup=True):
