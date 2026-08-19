@@ -26,6 +26,7 @@ user_proj_dim: 512
 mha_n_heads: 4
 pooling: Mean
 extension_strategy: Adaptive
+hyperedge_window_k: 3   # null = tắt nhánh local (hành vi HyCoRec gốc)
 # optim
 rec:
   epoch: 2

@@ -148,6 +148,8 @@ class HyCoRecModel(BaseModel):
         # MHA
         self.mha_n_heads = opt.get("mha_n_heads", 4)
         self.extension_strategy = opt.get("extension_strategy", None)
+        # global+local hyperedge windowing
+        self.hyperedge_window_k = opt.get("hyperedge_window_k", None)
         self.pretrain = opt.get("pretrain", False)
         self.pretrain_data = None
         self.pretrain_epoch = opt.get("pretrain_epoch", 9999)
@@ -348,6 +350,11 @@ class HyCoRecModel(BaseModel):
         self.hyper_conv_item = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
         self.hyper_conv_entity = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
         self.hyper_conv_word = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        # local (k-turn window) branch — separate weights from the global branch above
+        if self.hyperedge_window_k is not None:
+            self.hyper_conv_item_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+            self.hyper_conv_entity_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+            self.hyper_conv_word_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
         # pooling
@@ -475,10 +482,18 @@ class HyCoRecModel(BaseModel):
         knowledge_embedding,
         conceptnet_embedding,
         context_embedding,
+        local_session_embedding=None,
+        local_knowledge_embedding=None,
+        local_conceptnet_embedding=None,
     ):
-        related_embedding = torch.cat(
-            (session_embedding, knowledge_embedding, conceptnet_embedding), dim=0
-        )
+        related_parts = [session_embedding, knowledge_embedding, conceptnet_embedding]
+        if local_session_embedding is not None:
+            related_parts += [
+                local_session_embedding,
+                local_knowledge_embedding,
+                local_conceptnet_embedding,
+            ]
+        related_embedding = torch.cat(related_parts, dim=0)
         if context_embedding is None:
             if self.pooling == "Attn":
                 user_repr = self.kg_attn_his(related_embedding)
@@ -525,11 +540,65 @@ class HyCoRecModel(BaseModel):
 
         return embedding
 
+    # 获取局部（k-turn）超图嵌入
+    def _encode_local_branch(
+        self,
+        related_items_local,
+        related_entities_local,
+        related_words_local,
+        tot_item_embedding,
+        tot_entity_embedding,
+        tot_word_embedding,
+    ):
+        if self.hyperedge_window_k is None:
+            return None, None, None
+
+        local_item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
+        if len(related_items_local) > 0:
+            items, item_hyper_edge_index = self._get_hypergraph(
+                related_items_local, self.item_adj
+            )
+            sub_item_embedding, sub_item_edge_index, _ = self._before_hyperconv(
+                tot_item_embedding, items, item_hyper_edge_index, self.item_adj
+            )
+            local_item_embedding = self.hyper_conv_item_local(
+                sub_item_embedding, sub_item_edge_index
+            )
+
+        local_entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
+        if len(related_entities_local) > 0:
+            entities, entity_hyper_edge_index = self._get_hypergraph(
+                related_entities_local, self.entity_adj
+            )
+            sub_entity_embedding, sub_entity_edge_index, _ = self._before_hyperconv(
+                tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj
+            )
+            local_entity_embedding = self.hyper_conv_entity_local(
+                sub_entity_embedding, sub_entity_edge_index
+            )
+
+        local_word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
+        if len(related_words_local) > 0:
+            words, word_hyper_edge_index = self._get_hypergraph(
+                related_words_local, self.word_adj
+            )
+            sub_word_embedding, sub_word_edge_index, _ = self._before_hyperconv(
+                tot_word_embedding, words, word_hyper_edge_index, self.word_adj
+            )
+            local_word_embedding = self.hyper_conv_word_local(
+                sub_word_embedding, sub_word_edge_index
+            )
+
+        return local_item_embedding, local_entity_embedding, local_word_embedding
+
     def encode_user_repr(
         self,
         related_items,
         related_entities,
         related_words,
+        related_items_local,
+        related_entities_local,
+        related_words_local,
         tot_item_embedding,
         tot_entity_embedding,
         tot_word_embedding,
@@ -599,15 +668,29 @@ class HyCoRecModel(BaseModel):
             word_embedding = raw_word_embedding
             # word_embedding = self._get_embedding(owrds, raw_word_embedding, word_tot2sub, self.word_adj)
 
+        # 局部（k-turn）超图分支
+        local_item_embedding, local_entity_embedding, local_word_embedding = (
+            self._encode_local_branch(
+                related_items_local,
+                related_entities_local,
+                related_words_local,
+                tot_item_embedding,
+                tot_entity_embedding,
+                tot_word_embedding,
+            )
+        )
+
         # 注意力机制
         if len(related_entities) == 0:
             user_repr = self._attention_and_gating(
-                item_embedding, entity_embedding, word_embedding, None
+                item_embedding, entity_embedding, word_embedding, None,
+                local_item_embedding, local_entity_embedding, local_word_embedding,
             )
         else:
             context_embedding = tot_entity_embedding[related_entities]
             user_repr = self._attention_and_gating(
-                item_embedding, entity_embedding, word_embedding, context_embedding
+                item_embedding, entity_embedding, word_embedding, context_embedding,
+                local_item_embedding, local_entity_embedding, local_word_embedding,
             )
         return user_repr
 
@@ -632,18 +715,36 @@ class HyCoRecModel(BaseModel):
         batch_related_items,
         batch_related_entities,
         batch_related_words,
+        batch_related_items_local,
+        batch_related_entities_local,
+        batch_related_words_local,
         tot_item_embedding,
         tot_entity_embedding,
         tot_word_embedding,
     ):
         user_repr_list = []
-        for related_items, related_entities, related_words in zip(
-            batch_related_items, batch_related_entities, batch_related_words
+        for (
+            related_items,
+            related_entities,
+            related_words,
+            related_items_local,
+            related_entities_local,
+            related_words_local,
+        ) in zip(
+            batch_related_items,
+            batch_related_entities,
+            batch_related_words,
+            batch_related_items_local,
+            batch_related_entities_local,
+            batch_related_words_local,
         ):
             user_repr = self.encode_user_repr(
                 related_items,
                 related_entities,
                 related_words,
+                related_items_local,
+                related_entities_local,
+                related_words_local,
                 tot_item_embedding,
                 tot_entity_embedding,
                 tot_word_embedding,
@@ -660,6 +761,9 @@ class HyCoRecModel(BaseModel):
         related_item = batch["related_item"]
         related_entity = batch["related_entity"]
         related_word = batch["related_word"]
+        related_item_local = batch["related_item_local"]
+        related_entity_local = batch["related_entity_local"]
+        related_word_local = batch["related_word_local"]
         item = batch["item"]
         item_embedding = self.item_encoder(
             self.entity_embedding.weight, self.edge_idx, self.edge_type
@@ -677,6 +781,9 @@ class HyCoRecModel(BaseModel):
             related_item,
             related_entity,
             related_word,
+            related_item_local,
+            related_entity_local,
+            related_word_local,
             item_embedding,
             entity_embedding,
             token_embedding,
@@ -707,6 +814,10 @@ class HyCoRecModel(BaseModel):
             self.item_attn,
             self.rec_bias,
         ]
+        if self.hyperedge_window_k is not None:
+            freeze_models.append(self.hyper_conv_item_local)
+            freeze_models.append(self.hyper_conv_entity_local)
+            freeze_models.append(self.hyper_conv_word_local)
         if self.pooling == "Attn":
             freeze_models.append(self.kg_attn)
             freeze_models.append(self.kg_attn_his)
@@ -739,6 +850,9 @@ class HyCoRecModel(BaseModel):
         batch_related_items,
         batch_related_entities,
         batch_related_words,
+        batch_related_items_local,
+        batch_related_entities_local,
+        batch_related_words_local,
         tot_item_embedding,
         tot_entity_embedding,
         tot_word_embedding,
@@ -751,7 +865,17 @@ class HyCoRecModel(BaseModel):
             session_related_items,
             session_related_entities,
             session_related_words,
-        ) in zip(batch_related_items, batch_related_entities, batch_related_words):
+            session_related_items_local,
+            session_related_entities_local,
+            session_related_words_local,
+        ) in zip(
+            batch_related_items,
+            batch_related_entities,
+            batch_related_words,
+            batch_related_items_local,
+            batch_related_entities_local,
+            batch_related_words_local,
+        ):
             # COLD START
             # if len(session_related_items) == 0 or len(session_related_words) == 0:
             #     if len(session_related_entities) == 0:
@@ -813,24 +937,32 @@ class HyCoRecModel(BaseModel):
                 word_embedding = raw_word_embedding
                 # word_embedding = self._get_embedding(owrds, raw_word_embedding, word_tot2sub, self.word_adj)
 
+            # 局部（k-turn）超图分支
+            local_item_embedding, local_entity_embedding, local_word_embedding = (
+                self._encode_local_branch(
+                    session_related_items_local,
+                    session_related_entities_local,
+                    session_related_words_local,
+                    tot_item_embedding,
+                    tot_entity_embedding,
+                    tot_word_embedding,
+                )
+            )
+
             # 数据拼接
-            if len(session_related_entities) == 0:
-                session_repr = torch.cat(
-                    (item_embedding, entity_embedding, word_embedding), dim=0
-                )
-                session_repr_list.append(session_repr)
-            else:
+            session_parts = [item_embedding, entity_embedding]
+            if len(session_related_entities) > 0:
                 context_embedding = tot_entity_embedding[session_related_entities]
-                session_repr = torch.cat(
-                    (
-                        item_embedding,
-                        entity_embedding,
-                        context_embedding,
-                        word_embedding,
-                    ),
-                    dim=0,
-                )
-                session_repr_list.append(session_repr)
+                session_parts.append(context_embedding)
+            session_parts.append(word_embedding)
+            if local_item_embedding is not None:
+                session_parts += [
+                    local_item_embedding,
+                    local_entity_embedding,
+                    local_word_embedding,
+                ]
+            session_repr = torch.cat(session_parts, dim=0)
+            session_repr_list.append(session_repr)
 
         batch_seq_len = max(
             [
@@ -957,6 +1089,9 @@ class HyCoRecModel(BaseModel):
         related_item = batch["related_item"]
         related_entity = batch["related_entity"]
         related_word = batch["related_word"]
+        related_item_local = batch["related_item_local"]
+        related_entity_local = batch["related_entity_local"]
+        related_word_local = batch["related_word_local"]
         response = batch["response"]
 
         related_tokens = batch["related_tokens"]
@@ -977,6 +1112,9 @@ class HyCoRecModel(BaseModel):
             related_item,
             related_entity,
             related_word,
+            related_item_local,
+            related_entity_local,
+            related_word_local,
             item_embedding,
             entity_embedding,
             token_embedding,
@@ -988,6 +1126,9 @@ class HyCoRecModel(BaseModel):
             related_item,
             related_entity,
             related_word,
+            related_item_local,
+            related_entity_local,
+            related_word_local,
             item_embedding,
             entity_embedding,
             token_embedding,

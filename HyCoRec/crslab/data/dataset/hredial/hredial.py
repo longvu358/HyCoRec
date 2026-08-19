@@ -218,6 +218,14 @@ class HReDialDataset(BaseDataset):
     def _augment_and_add(self, raw_conv_dict):
         augmented_conv_dicts = []
         context_tokens, context_entities, context_words, context_items = [], [], [], []
+        # Incremental full-history accumulators (dedup'd for entity/word, kept
+        # in first-occurrence order), updated by O(new elements) per turn.
+        # Snapshotting these instead of re-flattening context_* downstream
+        # avoids redoing an O(turns) flatten+dedup pass at every turn, which
+        # would cost O(turns^2) per conversation over the whole dataset.
+        global_items = []
+        global_entities, entity_seen = [], set()
+        global_words, word_seen = [], set()
         for i, conv in enumerate(raw_conv_dict):
             text_tokens, entities, movies, words = (
                 conv["text"],
@@ -234,6 +242,9 @@ class HReDialDataset(BaseDataset):
                     "item": copy(context_items),
                     "entity": copy(context_entities),
                     "word": copy(context_words),
+                    "item_global": list(global_items),
+                    "entity_global": list(global_entities),
+                    "word_global": list(global_words),
                     "items": movies,
                 }
                 augmented_conv_dicts.append(conv_dict)
@@ -242,5 +253,15 @@ class HReDialDataset(BaseDataset):
             context_items.append(movies)
             context_entities.append(entities + movies)
             context_words.append(words)
+
+            global_items += movies
+            for entity in entities + movies:
+                if entity not in entity_seen:
+                    entity_seen.add(entity)
+                    global_entities.append(entity)
+            for word in words:
+                if word not in word_seen:
+                    word_seen.add(word)
+                    global_words.append(word)
 
         return augmented_conv_dicts
