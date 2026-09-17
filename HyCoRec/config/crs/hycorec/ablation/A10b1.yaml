@@ -1,0 +1,61 @@
+# Ablation A10b1 (CPC-Hypergraph v2, spec 6.2) -- derived from redial.yaml
+# dataset
+dataset: HReDial
+tokenize: nltk
+# dataloader
+related_truncate: 1024
+context_truncate: 256
+response_truncate: 30
+scale: 1
+# model
+model: HyCoRec
+token_emb_dim: 300
+kg_emb_dim: 128
+num_bases: 8
+n_heads: 2
+n_layers: 2
+ffn_size: 300
+dropout: 0.1
+attention_dropout: 0.0
+relu_dropout: 0.1
+learn_positional_embeddings: false
+embeddings_scale: true
+reduction: false
+n_positions: 1024
+user_proj_dim: 512
+# HyCoRec-CHANGE
+mha_n_heads: 4
+pooling: Mean
+extension_strategy: Adaptive
+# CPC-Hypergraph v2 (docs/contexual_personal_collective) — full model (~A9 minus review)
+scopes: [C, P, G]
+k_hist: 40
+k_hop: 1
+context_window_w: 3
+hconv_layers: 2
+alpha_init: [-1, 0, -1]
+ei_mode: xg
+freeze_alpha: true
+collective_path: null    # null -> data/collective/<dataset>/
+# optim
+rec:
+  epoch: 2
+  batch_size: 64
+  early_stop: False
+  stop_mode: min
+  impatience: 2
+  optimizer:
+    name: Adam
+    lr: !!float 1e-3
+conv:
+  epoch: 1
+  batch_size: 128
+  impatience: 1
+  optimizer:
+    name: Adam
+    lr: !!float 1e-3
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    patience: 3
+    factor: 0.5
+  gradient_clip: 0.1

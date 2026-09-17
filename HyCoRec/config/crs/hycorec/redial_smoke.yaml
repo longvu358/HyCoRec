@@ -1,0 +1,74 @@
+# SMOKE-TEST config — verifies the pipeline runs end-to-end on a tiny slice of data.
+# Not for reporting numbers. For the full run, use redial.yaml unchanged.
+#
+# Only 3 things are cut here, in order of impact on wall-clock time:
+#   1. scale        -> subsamples train/valid/test (crslab/data/dataloader/base.py:58-88)
+#   2. related_truncate -> shrinks the per-sample related-entity/word window that feeds
+#                           hypergraph construction (this is the expensive part per the
+#                           hub-node-degree finding: item/entity/word adjacency has very
+#                           long-tail degree, so smaller windows = much cheaper HypergraphConv)
+#   3. epoch         -> 1 epoch is enough to prove forward/backward/eval all execute
+#
+# Everything else (model width, heads, layers, dims) is left identical to redial.yaml,
+# so a pass here is a real signal that the architecture itself is wired correctly.
+
+# dataset
+dataset: HReDial
+tokenize: nltk
+# dataloader
+related_truncate: 256
+context_truncate: 256
+response_truncate: 30
+scale: 0.01
+# model
+model: HyCoRec
+token_emb_dim: 300
+kg_emb_dim: 128
+num_bases: 8
+n_heads: 2
+n_layers: 2
+ffn_size: 300
+dropout: 0.1
+attention_dropout: 0.0
+relu_dropout: 0.1
+learn_positional_embeddings: false
+embeddings_scale: true
+reduction: false
+n_positions: 1024
+user_proj_dim: 512
+# HyCoRec-CHANGE
+mha_n_heads: 4
+pooling: Mean
+extension_strategy: Adaptive
+# CPC-Hypergraph v2
+scopes: [C, P, G]
+k_hist: 40
+k_hop: 1
+context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
+hconv_layers: 2
+alpha_init: [-1, 0, -1]
+ei_mode: xg              # base | xg
+freeze_alpha: false
+collective_path: null    # null -> data/collective/<dataset>/
+# optim
+rec:
+  epoch: 1
+  batch_size: 64
+  early_stop: False
+  stop_mode: min
+  impatience: 2
+  optimizer:
+    name: Adam
+    lr: !!float 1e-3
+conv:
+  epoch: 1
+  batch_size: 128
+  impatience: 1
+  optimizer:
+    name: Adam
+    lr: !!float 1e-3
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    patience: 3
+    factor: 0.5
+  gradient_clip: 0.1
