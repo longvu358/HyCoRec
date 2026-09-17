@@ -16,6 +16,9 @@ class BaseEvaluator(ABC):
     def rec_evaluate(self, preds, label):
         pass
 
+    def rec_evaluate_tail(self, preds, label):
+        pass
+
     def gen_evaluate(self, preds, label):
         pass
 
