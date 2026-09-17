@@ -37,5 +37,6 @@ dev = [
     "kaggle>=2.2.4",
     "kagglehub>=1.0.2",
     "matplotlib>=3.8",
+    "pytest>=9.1.1",
     "ruff>=0.16.2",
 ]
