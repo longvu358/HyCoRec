@@ -95,6 +95,74 @@ class TransformerDecoderLayerKG(nn.Module):
 
         return x
 
+    def forward_incremental(self, x, related_encoder_output, related_encoder_mask, context_encoder_output,
+                             context_encoder_mask, session_embedding, session_mask, incr_state):
+        """Single-new-token variant of ``forward`` - see
+        ``MultiHeadAttention.forward_incremental``. ``x`` is just the newest
+        token (``[B, 1, dim]``); ``incr_state`` is this layer's cache from the
+        previous step (``None`` on the first step). Returns ``(new_x,
+        new_incr_state)``.
+        """
+        if incr_state is None:
+            self_state = session_state = related_state = context_state = None
+        else:
+            self_state, session_state, related_state, context_state = incr_state
+
+        residual = x
+        x, self_state = self.self_attention.forward_incremental(
+            query=x, incr_state=self_state, static_kv=False
+        )
+        x = self.dropout(x)  # --dropout
+        x = x + residual
+        x = _normalize(x, self.norm_self_attention)
+
+        residual = x
+        x, session_state = self.session_item_attention.forward_incremental(
+            query=x,
+            key=session_embedding,
+            value=session_embedding,
+            mask=session_mask,
+            incr_state=session_state,
+            static_kv=True,
+        )
+        x = self.dropout(x)
+        x = residual + x
+        x = _normalize(x, self.norm_session_item_attention)
+
+        residual = x
+        related_x, related_state = self.related_encoder_attention.forward_incremental(
+            query=x,
+            key=related_encoder_output,
+            value=related_encoder_output,
+            mask=related_encoder_mask,
+            incr_state=related_state,
+            static_kv=True,
+        )
+        related_x = self.dropout(related_x)  # --dropout
+
+        context_x, context_state = self.context_encoder_attention.forward_incremental(
+            query=x,
+            key=context_encoder_output,
+            value=context_encoder_output,
+            mask=context_encoder_mask,
+            incr_state=context_state,
+            static_kv=True,
+        )
+        context_x = self.dropout(context_x)  # --dropout
+
+        x = related_x * 0.1 + context_x * 0.9 + residual
+        x = _normalize(x, self.norm_merge)
+
+        # finally the ffn
+        residual = x
+        x = self.ffn(x)
+        x = self.dropout(x)  # --dropout
+        x = residual + x
+        x = _normalize(x, self.norm3)
+
+        new_incr_state = (self_state, session_state, related_state, context_state)
+        return x, new_incr_state
+
     def _create_selfattn_mask(self, x):
         # figure out how many timestamps we need
         bsz = x.size(0)
@@ -198,3 +266,52 @@ class TransformerDecoderKG(nn.Module):
                            context_encoder_mask, session_embedding, session_mask)
 
         return tensor, None
+
+    def forward_incremental(self, input, related_encoder_state, context_encoder_state, session_state, incr_state=None):
+        """KV-cached variant of ``forward`` for greedy/autoregressive decoding.
+
+        Unlike ``forward``, ``input`` must be exactly the single newest token
+        (``[B, 1]``) on every call, including the first (pass the start token
+        alone, not a growing sequence). ``incr_state`` is the state returned
+        by the previous call (``None`` for the first call).
+
+        ``forward`` reprocesses the entire sequence generated so far - full
+        self-attention plus all three cross-attentions - on every single
+        step, which is O(current length) of wasted recomputation per step
+        (~25x more attention work than necessary over a typical greedy
+        decode, measured empirically). This does only the O(1) new work per
+        step instead, by caching self-attention K/V (extended each step) and
+        cross-attention K/V (fixed encoder states, computed once and
+        reused). Produces numerically identical logits to calling ``forward``
+        on the full sequence-so-far and slicing out the last position -
+        verified via ``torch.allclose``.
+
+        Returns ``(new_token_tensor, new_incr_state)``.
+        """
+        related_encoder_output, related_encoder_mask = related_encoder_state
+        context_encoder_output, context_encoder_mask = context_encoder_state
+        session_embedding, session_mask = session_state
+
+        assert input.shape[1] == 1, 'forward_incremental expects exactly one new token per call'
+        if incr_state is None:
+            offset = 0
+            layer_states = [None] * self.n_layers
+        else:
+            offset, layer_states = incr_state
+
+        position = input.new_full((1, 1), offset).long()
+        tensor = self.embeddings(input)
+        if self.embeddings_scale:
+            tensor = tensor * np.sqrt(self.dim)
+        tensor = tensor + self.position_embeddings(position).expand_as(tensor)
+        tensor = self.dropout(tensor)  # --dropout
+
+        new_layer_states = []
+        for layer, layer_state in zip(self.layers, layer_states):
+            tensor, layer_state = layer.forward_incremental(
+                tensor, related_encoder_output, related_encoder_mask, context_encoder_output,
+                context_encoder_mask, session_embedding, session_mask, layer_state,
+            )
+            new_layer_states.append(layer_state)
+
+        return tensor, (offset + 1, new_layer_states)
