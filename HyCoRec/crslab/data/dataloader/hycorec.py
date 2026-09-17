@@ -15,35 +15,19 @@ from crslab.data.dataloader.utils import (
 
 
 class HyCoRecDataLoader(BaseDataLoader):
-    """Dataloader for model KBRD.
+    """Dataloader for HyCoRec / CPC-Hypergraph v2.
 
-    Notes:
-        You can set the following parameters in config:
+    Ships ragged id lists for the three preference scopes; the model builds the
+    incidence matrices (scope C / P) or applies the precomputed propagation
+    matrix (scope G):
 
-        - ``"context_truncate"``: the maximum length of context.
-        - ``"response_truncate"``: the maximum length of response.
-        - ``"entity_truncate"``: the maximum length of mentioned entities in context.
-
-        The following values must be specified in ``vocab``:
-
-        - ``"pad"``
-        - ``"start"``
-        - ``"end"``
-        - ``"pad_entity"``
-
-        the above values specify the id of needed special token.
-
+    * ``context_turn_{item,entity,word}``  -- list-of-turns, turn-local (scope C)
+    * ``history_session_{item,entity,word}`` -- list-of-sessions (scope P, D_u(d))
+    * ``readout_{item,entity,word}``       -- flat V_f(d<=t) (pooling supports Q^C, Q^G)
+    * ``has_history``                      -- whether D_u(d) is non-empty (cold-start)
     """
 
     def __init__(self, opt, dataset, vocab):
-        """
-
-        Args:
-            opt (Config or dict): config for dataloader or the whole system.
-            dataset: data for model.
-            vocab (dict): all kinds of useful size, idx and map between token and idx.
-
-        """
         super().__init__(opt, dataset)
         self.pad_token_idx = vocab["tok2ind"]["__pad__"]
         self.start_token_idx = vocab["tok2ind"]["__start__"]
@@ -53,126 +37,73 @@ class HyCoRecDataLoader(BaseDataLoader):
         self.context_truncate = opt.get("context_truncate", None)
         self.response_truncate = opt.get("response_truncate", None)
         self.entity_truncate = opt.get("entity_truncate", None)
-        self.hyperedge_window_k = opt.get("hyperedge_window_k", None)
-        self.review_entity2id = vocab["entity2id"]
 
     @staticmethod
-    def _flatten_turns(turns, k=None, dedup=True):
-        """Flatten a per-turn list-of-lists into a single list.
-
-        k=None flattens the full history (global branch, matches the
-        pre-windowing behavior). k=N keeps only the last N turns (local
-        branch). dedup=True keeps first-occurrence order, matching the old
-        entity/word accumulation; dedup=False preserves duplicates, matching
-        the old item accumulation.
-        """
-        if k is None:
-            window = turns
-        elif k <= 0:
-            window = []
-        else:
-            window = turns[-k:]
-        flat = [x for turn in window for x in turn]
+    def _flatten(turns, dedup=True):
+        flat = [x for turn in turns for x in turn]
         return list(dict.fromkeys(flat)) if dedup else flat
 
-    @staticmethod
-    def _global_related(conv_dict, global_key, turns_key, dedup):
-        """Full-history related list: use the dataset's precomputed
-        incremental accumulator (see hredial.py's _augment_and_add) when
-        available, since it avoids re-flattening the whole per-conversation
-        history at every turn. Datasets that don't provide it fall back to
-        flattening conv_dict[turns_key] here.
-        """
-        precomputed = conv_dict.get(global_key)
-        if precomputed is not None:
-            return precomputed
-        return HyCoRecDataLoader._flatten_turns(conv_dict[turns_key], dedup=dedup)
+    def _scope_fields(self, conv_dict):
+        """Common per-sample scope payload (shared by rec and conv)."""
+        history = conv_dict.get("history_session_items") or []
+        return {
+            "context_turn_item": conv_dict["item"],
+            "context_turn_entity": conv_dict["entity"],
+            "context_turn_word": conv_dict["word"],
+            "history_session_item": conv_dict.get("history_session_items") or [],
+            "history_session_entity": conv_dict.get("history_session_entities") or [],
+            "history_session_word": conv_dict.get("history_session_words") or [],
+            "readout_item": conv_dict.get("item_global")
+            or self._flatten(conv_dict["item"], dedup=False),
+            "readout_entity": conv_dict.get("entity_global")
+            or self._flatten(conv_dict["entity"]),
+            "readout_word": conv_dict.get("word_global")
+            or self._flatten(conv_dict["word"]),
+            "has_history": len(history) > 0,
+            "conv_id": conv_dict["conv_id"],
+        }
 
+    # ---- recommendation ----------------------------------------------------
     def rec_process_fn(self):
         augment_dataset = []
         for conv_dict in tqdm(self.dataset):
-            if conv_dict["role"] == "Recommender":
-                related_item = self._global_related(
-                    conv_dict, "item_global", "item", dedup=False
-                )
-                related_entity = self._global_related(
-                    conv_dict, "entity_global", "entity", dedup=True
-                )
-                related_word = self._global_related(
-                    conv_dict, "word_global", "word", dedup=True
-                )
-                related_item_local = self._flatten_turns(
-                    conv_dict["item"], k=self.hyperedge_window_k, dedup=False
-                )
-                related_entity_local = self._flatten_turns(
-                    conv_dict["entity"], k=self.hyperedge_window_k
-                )
-                related_word_local = self._flatten_turns(
-                    conv_dict["word"], k=self.hyperedge_window_k
-                )
-                for item in conv_dict["items"]:
-                    augment_conv_dict = {
-                        "conv_id": conv_dict["conv_id"],
-                        "related_item": related_item,
-                        "related_entity": related_entity,
-                        "related_word": related_word,
-                        "related_item_local": related_item_local,
-                        "related_entity_local": related_entity_local,
-                        "related_word_local": related_word_local,
-                        "item": item,
-                    }
-                    augment_dataset.append(augment_conv_dict)
-
+            if conv_dict["role"] != "Recommender":
+                continue
+            scope = self._scope_fields(conv_dict)
+            for item in conv_dict["items"]:
+                augment_dataset.append({**scope, "item": item})
         return augment_dataset
 
+    @staticmethod
+    def _collate_scope(batch):
+        keys = (
+            "context_turn_item",
+            "context_turn_entity",
+            "context_turn_word",
+            "history_session_item",
+            "history_session_entity",
+            "history_session_word",
+            "readout_item",
+            "readout_entity",
+            "readout_word",
+        )
+        out = {k: [d[k] for d in batch] for k in keys}
+        out["has_history"] = [d["has_history"] for d in batch]
+        out["conv_id"] = [d["conv_id"] for d in batch]
+        return out
+
     def rec_batchify(self, batch):
-        batch_related_item = []
-        batch_related_entity = []
-        batch_related_word = []
-        batch_related_item_local = []
-        batch_related_entity_local = []
-        batch_related_word_local = []
-        batch_movies = []
-        batch_conv_id = []
-        for conv_dict in batch:
-            batch_related_item.append(conv_dict["related_item"])
-            batch_related_entity.append(conv_dict["related_entity"])
-            batch_related_word.append(conv_dict["related_word"])
-            batch_related_item_local.append(conv_dict["related_item_local"])
-            batch_related_entity_local.append(conv_dict["related_entity_local"])
-            batch_related_word_local.append(conv_dict["related_word_local"])
-            batch_movies.append(conv_dict["item"])
-            batch_conv_id.append(conv_dict["conv_id"])
-
-        res = {
-            "conv_id": batch_conv_id,
-            "related_item": batch_related_item,
-            "related_entity": batch_related_entity,
-            "related_word": batch_related_word,
-            "related_item_local": batch_related_item_local,
-            "related_entity_local": batch_related_entity_local,
-            "related_word_local": batch_related_word_local,
-            "item": torch.tensor(batch_movies, dtype=torch.long),
-        }
-
+        res = self._collate_scope(batch)
+        res["item"] = torch.tensor([d["item"] for d in batch], dtype=torch.long)
         return res
 
+    # ---- conversation ----------------------------------------------------
     def conv_process_fn(self, *args, **kwargs):
         return self.retain_recommender_target()
 
     def conv_batchify(self, batch):
-        batch_related_tokens = []
-        batch_context_tokens = []
-
-        batch_related_item = []
-        batch_related_entity = []
-        batch_related_word = []
-        batch_related_item_local = []
-        batch_related_entity_local = []
-        batch_related_word_local = []
-
-        batch_response = []
-        batch_conv_id = []
+        res = self._collate_scope([self._scope_fields(d) for d in batch])
+        batch_related_tokens, batch_context_tokens, batch_response = [], [], []
         for conv_dict in batch:
             batch_related_tokens.append(
                 truncate(
@@ -191,28 +122,6 @@ class HyCoRecDataLoader(BaseDataLoader):
                     truncate_tail=False,
                 )
             )
-
-            batch_related_item.append(
-                self._global_related(conv_dict, "item_global", "item", dedup=False)
-            )
-            batch_related_entity.append(
-                self._global_related(conv_dict, "entity_global", "entity", dedup=True)
-            )
-            batch_related_word.append(
-                self._global_related(conv_dict, "word_global", "word", dedup=True)
-            )
-            batch_related_item_local.append(
-                self._flatten_turns(
-                    conv_dict["item"], k=self.hyperedge_window_k, dedup=False
-                )
-            )
-            batch_related_entity_local.append(
-                self._flatten_turns(conv_dict["entity"], k=self.hyperedge_window_k)
-            )
-            batch_related_word_local.append(
-                self._flatten_turns(conv_dict["word"], k=self.hyperedge_window_k)
-            )
-
             batch_response.append(
                 add_start_end_token_idx(
                     truncate(conv_dict["response"], self.response_truncate - 2),
@@ -220,25 +129,13 @@ class HyCoRecDataLoader(BaseDataLoader):
                     end_token_idx=self.end_token_idx,
                 )
             )
-            batch_conv_id.append(conv_dict["conv_id"])
-
-        res = {
-            "related_tokens": padded_tensor(
-                batch_related_tokens, self.pad_token_idx, pad_tail=False
-            ),
-            "context_tokens": padded_tensor(
-                batch_context_tokens, self.pad_token_idx, pad_tail=False
-            ),
-            "related_item": batch_related_item,
-            "related_entity": batch_related_entity,
-            "related_word": batch_related_word,
-            "related_item_local": batch_related_item_local,
-            "related_entity_local": batch_related_entity_local,
-            "related_word_local": batch_related_word_local,
-            "response": padded_tensor(batch_response, self.pad_token_idx),
-            "conv_id": batch_conv_id,
-        }
-
+        res["related_tokens"] = padded_tensor(
+            batch_related_tokens, self.pad_token_idx, pad_tail=False
+        )
+        res["context_tokens"] = padded_tensor(
+            batch_context_tokens, self.pad_token_idx, pad_tail=False
+        )
+        res["response"] = padded_tensor(batch_response, self.pad_token_idx)
         return res
 
     def policy_batchify(self, *args, **kwargs):
