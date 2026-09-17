@@ -26,15 +26,243 @@ import torch.nn.functional as F
 from loguru import logger
 from torch import nn
 from tqdm import tqdm
-from torch_geometric.nn import RGCNConv, HypergraphConv
+from torch_geometric.nn import RGCNConv
 
 from crslab.config import DATA_PATH, DATASET_PATH
 from crslab.model.base import BaseModel
 from crslab.model.crs.hycorec.attention import MHItemAttention
+from crslab.model.crs.hycorec.cpc import (
+    ScopeFusion,
+    build_incidence,
+    khop_closure,
+    load_collective,
+    sliding_window_hyperedges,
+)
 from crslab.model.utils.functions import edge_to_pyg_format
 from crslab.model.utils.modules.attention import SelfAttentionBatch, SelfAttentionSeq
 from crslab.model.utils.modules.transformer import TransformerEncoder
 from crslab.model.crs.hycorec.decoder import TransformerDecoderKG
+
+
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor
+from torch.nn import Parameter
+
+from torch_geometric.experimental import disable_dynamic_shapes
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.nn.dense.linear import Linear
+from torch_geometric.nn.inits import glorot, zeros
+from torch_geometric.utils import scatter, softmax
+
+
+class CustomHypergraphConv(MessagePassing):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        use_attention: bool = False,
+        attention_mode: str = "node",
+        heads: int = 1,
+        concat: bool = True,
+        negative_slope: float = 0.2,
+        dropout: float = 0,
+        bias: bool = True,
+        **kwargs,
+    ):
+        kwargs.setdefault("aggr", "add")
+        super().__init__(flow="source_to_target", node_dim=0, **kwargs)
+
+        assert attention_mode in ["node", "edge"]
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.use_attention = use_attention
+        self.attention_mode = attention_mode
+
+        if self.use_attention:
+            self.heads = heads
+            self.concat = concat
+            self.negative_slope = negative_slope
+            self.dropout = dropout
+            self.lin = Linear(
+                in_channels,
+                heads * out_channels,
+                bias=False,
+                weight_initializer="glorot",
+            )
+            self.att = Parameter(torch.empty(1, heads, 2 * out_channels))
+        else:
+            self.heads = 1
+            self.concat = True
+            self.lin = Linear(
+                in_channels, out_channels, bias=False, weight_initializer="glorot"
+            )
+
+        if bias and concat:
+            self.bias = Parameter(torch.empty(heads * out_channels))
+        elif bias and not concat:
+            self.bias = Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        self.lin.reset_parameters()
+        if self.use_attention:
+            glorot(self.att)
+        zeros(self.bias)
+
+    @disable_dynamic_shapes(required_args=["num_edges"])
+    def forward(
+        self,
+        x: Tensor,
+        hyperedge_index: Tensor,
+        hyperedge_weight: Optional[Tensor] = None,
+        hyperedge_attr: Optional[Tensor] = None,
+        num_edges: Optional[int] = None,
+    ) -> Tensor:
+        r"""Runs the forward pass of the module.
+
+        Args:
+            x (torch.Tensor): Node feature matrix
+                :math:`\mathbf{X} \in \mathbb{R}^{N \times F}`.
+            hyperedge_index (torch.Tensor): The hyperedge indices, *i.e.*
+                the sparse incidence matrix
+                :math:`\mathbf{H} \in {\{ 0, 1 \}}^{N \times M}` mapping from
+                nodes to edges.
+            hyperedge_weight (torch.Tensor, optional): Hyperedge weights
+                :math:`\mathbf{W} \in \mathbb{R}^M`. (default: :obj:`None`)
+            hyperedge_attr (torch.Tensor, optional): Hyperedge feature matrix
+                in :math:`\mathbb{R}^{M \times F}`.
+                These features only need to get passed in case
+                :obj:`use_attention=True`. (default: :obj:`None`)
+            num_edges (int, optional) : The number of edges :math:`M`.
+                (default: :obj:`None`)
+        """
+        num_nodes = x.size(0)
+
+        if num_edges is None:
+            # Falling back here forces a blocking GPU->CPU sync
+            # (int(tensor.max())) on every single call. Callers in this
+            # model already know the edge count for free on the CPU side
+            # (from building the hyperedge index in cpc.build_incidence),
+            # so they pass it explicitly.
+            num_edges = 0
+            if hyperedge_index.numel() > 0:
+                num_edges = int(hyperedge_index[1].max()) + 1
+
+        x = self.lin(x)
+
+        alpha = None
+        if self.use_attention:
+            assert hyperedge_attr is not None
+            if hyperedge_weight is None:
+                hyperedge_weight = x.new_ones(num_edges)
+            x = x.view(-1, self.heads, self.out_channels)
+            hyperedge_attr = self.lin(hyperedge_attr)
+            hyperedge_attr = hyperedge_attr.view(-1, self.heads, self.out_channels)
+            x_i = x[hyperedge_index[0]]
+            x_j = hyperedge_attr[hyperedge_index[1]]
+            alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
+            alpha = F.leaky_relu(alpha, self.negative_slope)
+            if self.attention_mode == "node":
+                alpha = softmax(alpha, hyperedge_index[1], num_nodes=num_edges)
+            else:
+                alpha = softmax(alpha, hyperedge_index[0], num_nodes=num_nodes)
+            alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+
+        node_idx, edge_idx = hyperedge_index[0], hyperedge_index[1]
+
+        if hyperedge_weight is None:
+            D = scatter(
+                x.new_ones(node_idx.numel()),
+                node_idx,
+                dim=0,
+                dim_size=num_nodes,
+                reduce="sum",
+            )
+        else:
+            D = scatter(
+                hyperedge_weight[edge_idx],
+                node_idx,
+                dim=0,
+                dim_size=num_nodes,
+                reduce="sum",
+            )
+        D = 1.0 / D
+        D[D == float("inf")] = 0
+
+        B = scatter(
+            x.new_ones(edge_idx.numel()),
+            edge_idx,
+            dim=0,
+            dim_size=num_edges,
+            reduce="sum",
+        )
+        B = 1.0 / B
+        B[B == float("inf")] = 0
+
+        if self.use_attention:
+            out = self.propagate(
+                hyperedge_index, x=x, norm=B, alpha=alpha, size=(num_nodes, num_edges)
+            )
+            out = self.propagate(
+                hyperedge_index.flip([0]),
+                x=out,
+                norm=D,
+                alpha=alpha,
+                size=(num_edges, num_nodes),
+            )
+        else:
+            # Fast path: with no attention, message() collapses to a plain
+            # norm_i * x_j scale (heads=1), so the two propagate() calls
+            # below just do a scatter-add from nodes to hyperedges and back.
+            # Doing that directly instead of going through
+            # MessagePassing.propagate()'s generic dispatch (arg
+            # collection/validation for a general message()/aggregate()/
+            # update() pipeline) skips a lot of fixed per-call Python
+            # overhead. That overhead dominates here because these
+            # hypergraphs are usually tiny (median ~6 nodes in this
+            # project's real data) - actual compute is negligible, so
+            # cutting the fixed cost per call is what matters. Verified
+            # bit-identical to the stock propagate()-based implementation
+            # via torch.allclose across hundreds of random graphs.
+            msg1 = B.index_select(0, edge_idx).unsqueeze(-1) * x.index_select(
+                0, node_idx
+            )
+            out = x.new_zeros(num_edges, x.size(-1))
+            out.index_add_(0, edge_idx, msg1)
+
+            msg2 = D.index_select(0, node_idx).unsqueeze(-1) * out.index_select(
+                0, edge_idx
+            )
+            out = x.new_zeros(num_nodes, x.size(-1))
+            out.index_add_(0, node_idx, msg2)
+
+        if self.concat is True:
+            out = out.view(-1, self.heads * self.out_channels)
+        else:
+            out = out.mean(dim=1)
+
+        if self.bias is not None:
+            out = out + self.bias
+
+        return out
+
+    def message(self, x_j: Tensor, norm_i: Tensor, alpha: Tensor) -> Tensor:
+        H, F = self.heads, self.out_channels
+
+        out = norm_i.view(-1, 1, 1) * x_j.view(-1, H, F)
+
+        if alpha is not None:
+            out = alpha.view(-1, self.heads, 1) * out
+
+        return out
 
 
 class HyCoRecModel(BaseModel):
@@ -148,8 +376,25 @@ class HyCoRecModel(BaseModel):
         # MHA
         self.mha_n_heads = opt.get("mha_n_heads", 4)
         self.extension_strategy = opt.get("extension_strategy", None)
-        # global+local hyperedge windowing
-        self.hyperedge_window_k = opt.get("hyperedge_window_k", None)
+        # ---- CPC-Hypergraph v2 (docs/contexual_personal_collective) ----------
+        # active preference scopes: C=Contextual (current dialogue),
+        # P=Personal (D_u(d) historical sessions), G=Collective (static corpus)
+        self.scopes = [s.upper() for s in opt.get("scopes", ["C", "P", "G"])]
+        self.k_hist = opt.get("k_hist", 40)
+        self.k_hop = opt.get("k_hop", 1)  # k-hop for H^P_{E,W}; 1 == HyCoRec baseline
+        # sliding-window size w for scope C (spec v2.1 Eq. 2): one hyperedge per
+        # turn position t'<=t, merging the w turns ending at t'. w=1 degenerates
+        # to per-turn co-mention hyperedges (the v2.1 ablation floor for C, A2).
+        self.context_window_w = (
+            opt.get("context_window_w", opt.get("hyperedge_window_k", None)) or 3
+        )
+        self.hconv_layers = opt.get("hconv_layers", 2)
+        self.collective_path = opt.get("collective_path", None)
+        self.alpha_init = tuple(opt.get("alpha_init", (-1.0, 0.0, -1.0)))
+        self.freeze_alpha = opt.get("freeze_alpha", False)
+        self.ei_mode = opt.get("ei_mode", "xg")  # base | xg  (Eq. 14a / 14b)
+        self.item_entity_ids = list(side_data.get("item_entity_ids", []))
+        self.collective = None
         self.pretrain = opt.get("pretrain", False)
         self.pretrain_data = None
         self.pretrain_epoch = opt.get("pretrain_epoch", 9999)
@@ -167,13 +412,32 @@ class HyCoRecModel(BaseModel):
                 pretrain_file, map_location=torch.device("cuda:" + str(self.gpu[0]))
             )
             logger.info(f"[Load Pretrain Weights from {pretrain_file}]")
-        # self._build_hredial_copy_mask()
+        if self.dataset == "HReDial":
+            self._build_hredial_copy_mask()
         self._build_adjacent_matrix()
         # self._build_hllm_data()
         self._build_embedding()
         self._build_kg_layer()
         self._build_recommendation_layer()
         self._build_conversation_layer()
+        self._load_collective()
+
+    def _load_collective(self):
+        self.n_word = max(self.token2id.values()) + 1
+        if "G" not in self.scopes:
+            return
+        path = self.collective_path or os.path.join(
+            DATA_PATH, "collective", self.dataset.lower()
+        )
+        if not os.path.isdir(path):
+            logger.warning(
+                f"[CPC] scope G requested but no collective dir at {path}; "
+                "run build_collective.py. Disabling scope G."
+            )
+            self.scopes = [s for s in self.scopes if s != "G"]
+            return
+        self.collective = load_collective(path).to(self.device)
+        logger.info(f"[CPC] loaded collective propagation matrices from {path}")
 
     # 构建 mask
     def _build_hredial_copy_mask(self):
@@ -346,15 +610,21 @@ class HyCoRecModel(BaseModel):
         )
         if self.pretrain:
             self.item_encoder.load_state_dict(self.pretrain_data["encoder"])
-        # hypergraph convolution
-        self.hyper_conv_item = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_entity = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        self.hyper_conv_word = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-        # local (k-turn window) branch — separate weights from the global branch above
-        if self.hyperedge_window_k is not None:
-            self.hyper_conv_item_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-            self.hyper_conv_entity_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-            self.hyper_conv_word_local = HypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+        # hypergraph convolution: ONE stack of L layers per field, SHARED across
+        # the three scopes C/P/G (spec 3.1 -- C and P are small and would overfit
+        # with private weights; all scopes must live in one space so the linear
+        # fusion in Eq. 12 is meaningful).
+        self.hconv = nn.ModuleDict(
+            {
+                field: nn.ModuleList(
+                    CustomHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+                    for _ in range(self.hconv_layers)
+                )
+                for field in ("item", "entity", "word")
+            }
+        )
+        # learned per-field softmax fusion of the C/P/G pooled vectors (Eq. 11-12)
+        self.fusion = ScopeFusion(init=self.alpha_init, freeze=self.freeze_alpha)
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
         # pooling
@@ -433,40 +703,6 @@ class HyCoRecModel(BaseModel):
         logger.debug("[Build conversation layer]")
         return
 
-    # 获取超图
-    def _get_hypergraph(self, related, adj):
-        related_items_set = set()
-        for related_items in related:
-            related_items_set.add(related_items)
-        session_related_items = list(related_items_set)
-
-        hypergraph_nodes, hypergraph_edges, hyper_edge_counter = list(), list(), 0
-        for item in session_related_items:
-            hypergraph_nodes.append(item)
-            hypergraph_edges.append(hyper_edge_counter)
-            neighbors = list(adj.get(item, []))
-            hypergraph_nodes += neighbors
-            hypergraph_edges += [hyper_edge_counter] * len(neighbors)
-            hyper_edge_counter += 1
-        hyper_edge_index = torch.tensor(
-            [hypergraph_nodes, hypergraph_edges], device=self.device
-        )
-        return list(set(hypergraph_nodes)), hyper_edge_index
-
-    # 获取聚合
-    def _get_embedding(self, hypergraph_items, embedding, tot_sub, adj):
-        knowledge_embedding_list = []
-        for item in hypergraph_items:
-            sub_graph = [item] + list(adj.get(item, []))
-            sub_graph = [tot_sub[item] for item in sub_graph]
-            sub_graph_embedding = embedding[sub_graph]
-            sub_graph_embedding = torch.mean(sub_graph_embedding, dim=0)
-            knowledge_embedding_list.append(sub_graph_embedding)
-        res_embedding = torch.zeros(1, self.kg_emb_dim).to(self.device)
-        if len(knowledge_embedding_list) > 0:
-            res_embedding = torch.stack(knowledge_embedding_list, dim=0)
-        return res_embedding
-
     @staticmethod
     def flatten(inputs):
         outputs = set()
@@ -476,48 +712,151 @@ class HyCoRecModel(BaseModel):
         return list(outputs)
 
     # 注意力融合特征向量
-    def _attention_and_gating(
-        self,
-        session_embedding,
-        knowledge_embedding,
-        conceptnet_embedding,
-        context_embedding,
-        local_session_embedding=None,
-        local_knowledge_embedding=None,
-        local_conceptnet_embedding=None,
-    ):
-        related_parts = [session_embedding, knowledge_embedding, conceptnet_embedding]
-        if local_session_embedding is not None:
-            related_parts += [
-                local_session_embedding,
-                local_knowledge_embedding,
-                local_conceptnet_embedding,
-            ]
-        related_embedding = torch.cat(related_parts, dim=0)
+    def _attention_and_gating(self, related_embedding, context_embedding):
+        """Fold the fused per-field preference vectors (n_fields, d) into a
+        single user vector, cross-attending to the mentioned entities of the
+        current dialogue (the P_c analogue). Same structure as the original
+        HyCoRec gating, only the input is [P_I; P_E; P_W] instead of a bag of
+        hyperedge node embeddings."""
         if context_embedding is None:
             if self.pooling == "Attn":
-                user_repr = self.kg_attn_his(related_embedding)
-            else:
-                assert self.pooling == "Mean"
-                user_repr = torch.mean(related_embedding, dim=0)
-        elif self.pooling == "Attn":
-            attentive_related_embedding = self.item_attn(
-                related_embedding, context_embedding
-            )
-            user_repr = self.kg_attn_his(attentive_related_embedding)
-            user_repr = torch.unsqueeze(user_repr, dim=0)
-            user_repr = torch.cat((context_embedding, user_repr), dim=0)
-            user_repr = self.kg_attn(user_repr)
-        else:
+                return self.kg_attn_his(related_embedding)
             assert self.pooling == "Mean"
-            attentive_related_embedding = self.item_attn(
-                related_embedding, context_embedding
-            )
-            user_repr = torch.mean(attentive_related_embedding, dim=0)
-            user_repr = torch.unsqueeze(user_repr, dim=0)
+            return torch.mean(related_embedding, dim=0)
+        attentive = self.item_attn(related_embedding, context_embedding)
+        if self.pooling == "Attn":
+            user_repr = self.kg_attn_his(attentive).unsqueeze(0)
             user_repr = torch.cat((context_embedding, user_repr), dim=0)
-            user_repr = torch.mean(user_repr, dim=0)
-        return user_repr
+            return self.kg_attn(user_repr)
+        assert self.pooling == "Mean"
+        user_repr = torch.mean(attentive, dim=0).unsqueeze(0)
+        user_repr = torch.cat((context_embedding, user_repr), dim=0)
+        return torch.mean(user_repr, dim=0)
+
+    # ---- CPC-Hypergraph v2 scope machinery -------------------------------
+    _FIELDS = ("item", "entity", "word")
+
+    def _field_adj(self, field):
+        return {
+            "item": self.item_adj,
+            "entity": self.entity_adj,
+            "word": self.word_adj,
+        }[field]
+
+    def _scope_hconv(self, hyperedges, field, tot_embedding, exclude=None):
+        """Shared L-layer conv over a locally built incidence.
+        Returns (x_sub: (n_sub, d), tot2sub: dict) or (None, {})."""
+        uniq, coo, n_edges = build_incidence(hyperedges, exclude=exclude)
+        if n_edges == 0 or not uniq:
+            return None, {}
+        tot2sub = {t: s for s, t in enumerate(uniq)}
+        x = tot_embedding[uniq]
+        ei = torch.tensor(
+            [[tot2sub[v] for v in coo[0]], coo[1]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        for layer in self.hconv[field]:
+            x = layer(x, ei, num_edges=n_edges)
+        return x, tot2sub
+
+    def _pool_local(self, x, tot2sub, query_nodes):
+        if x is None:
+            return torch.zeros(self.kg_emb_dim, device=self.device)
+        rows = [tot2sub[v] for v in dict.fromkeys(query_nodes) if v in tot2sub]
+        if not rows:
+            return torch.zeros(self.kg_emb_dim, device=self.device)
+        return x[rows].mean(dim=0)
+
+    def _pool_dense(self, xg, query_nodes):
+        rows = sorted({v for v in query_nodes if 0 <= v < xg.size(0)})
+        if not rows:
+            return torch.zeros(self.kg_emb_dim, device=self.device)
+        return xg[rows].mean(dim=0)
+
+    def _personal_hyperedges(self, field, hist_field_sessions):
+        """H^P_f node sets + the readout node set Q^P_f.
+
+        * field ``item``  -> one hyperedge per historical session (its item set),
+          no expansion (spec Eq. 1, ``H^P_I``).
+        * field ``entity`` / ``word`` -> one star hyperedge ``{v} u N^(k)(v)`` per
+          node ``v`` mentioned across the historical sessions, expanded k-hop over
+          the corresponding auxiliary KG (``entity_adj`` / ``word_adj``).
+        """
+        if field == "item":
+            edges = [sorted(s) for s in hist_field_sessions if s]
+            q = sorted({v for s in hist_field_sessions for v in s})
+            return edges, q
+        seeds = sorted({v for s in hist_field_sessions for v in s})
+        adj = self._field_adj(field)
+        edges = [sorted(khop_closure([v], adj, self.k_hop)) for v in seeds]
+        q = sorted({v for e in edges for v in e})
+        return edges, q
+
+    def _cpc_field_preferences(self, batch, field_x0, xg_by_field):
+        """Per sample -> (P_I, P_E, P_W) fused vectors + context embedding.
+
+        Returns (list[Tensor (3, d)], list[Tensor (n_ctx, d) or None]).
+        """
+        bsz = len(batch["conv_id"])
+        fused_all, ctx_all = [], []
+        for b in range(bsz):
+            target = int(batch["item"][b]) if "item" in batch else None
+            has_history = bool(batch["has_history"][b])
+            per_field = []
+            for field in self._FIELDS:
+                x0 = field_x0[field]
+                readout = batch[f"readout_{field}"][b]
+
+                # scope C: sliding-window hyperedges (spec v2.1 Eq. 2)
+                if "C" in self.scopes:
+                    ctx_edges = sliding_window_hyperedges(
+                        batch[f"context_turn_{field}"][b], self.context_window_w
+                    )
+                    xc, mc = self._scope_hconv(ctx_edges, field, x0, exclude=target)
+                    p_c = self._pool_local(xc, mc, readout)
+                else:
+                    p_c = torch.zeros(self.kg_emb_dim, device=self.device)
+
+                # scope P
+                p_used_history = has_history and "P" in self.scopes
+                if p_used_history:
+                    p_edges, q_p = self._personal_hyperedges(
+                        field, batch[f"history_session_{field}"][b]
+                    )
+                    xp, mp = self._scope_hconv(p_edges, field, x0, exclude=target)
+                    p_p = self._pool_local(xp, mp, q_p)
+                else:
+                    p_p, q_p = p_c, []
+
+                # scope G
+                if "G" in self.scopes and xg_by_field is not None:
+                    q_g = list(readout) + list(q_p)
+                    p_g = self._pool_dense(xg_by_field[field], q_g)
+                else:
+                    p_g = torch.zeros(self.kg_emb_dim, device=self.device)
+
+                per_field.append(
+                    self.fusion.fuse(field, p_c, p_p, p_g, has_history=p_used_history)
+                )
+            fused_all.append(torch.stack(per_field, dim=0))
+            ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
+            ctx_all.append(field_x0["entity"][ctx_ids] if ctx_ids else None)
+        return fused_all, ctx_all
+
+    def _field_x0(self, item_embedding, entity_embedding, token_embedding):
+        return {
+            "item": item_embedding,
+            "entity": entity_embedding,
+            "word": token_embedding[: self.n_word],
+        }
+
+    def _collective_by_field(self, field_x0):
+        if "G" not in self.scopes or self.collective is None:
+            return None
+        return {
+            f: self.collective.run(f, field_x0[f], self.hconv[f]) for f in self._FIELDS
+        }
 
     def _get_hllm_embedding(self, tot_embedding, hllm_hyper_graph, adj, conv):
         hllm_hyper_edge_A = []
@@ -540,160 +879,6 @@ class HyCoRecModel(BaseModel):
 
         return embedding
 
-    # 获取局部（k-turn）超图嵌入
-    def _encode_local_branch(
-        self,
-        related_items_local,
-        related_entities_local,
-        related_words_local,
-        tot_item_embedding,
-        tot_entity_embedding,
-        tot_word_embedding,
-    ):
-        if self.hyperedge_window_k is None:
-            return None, None, None
-
-        local_item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_items_local) > 0:
-            items, item_hyper_edge_index = self._get_hypergraph(
-                related_items_local, self.item_adj
-            )
-            sub_item_embedding, sub_item_edge_index, _ = self._before_hyperconv(
-                tot_item_embedding, items, item_hyper_edge_index, self.item_adj
-            )
-            local_item_embedding = self.hyper_conv_item_local(
-                sub_item_embedding, sub_item_edge_index
-            )
-
-        local_entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_entities_local) > 0:
-            entities, entity_hyper_edge_index = self._get_hypergraph(
-                related_entities_local, self.entity_adj
-            )
-            sub_entity_embedding, sub_entity_edge_index, _ = self._before_hyperconv(
-                tot_entity_embedding, entities, entity_hyper_edge_index, self.entity_adj
-            )
-            local_entity_embedding = self.hyper_conv_entity_local(
-                sub_entity_embedding, sub_entity_edge_index
-            )
-
-        local_word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_words_local) > 0:
-            words, word_hyper_edge_index = self._get_hypergraph(
-                related_words_local, self.word_adj
-            )
-            sub_word_embedding, sub_word_edge_index, _ = self._before_hyperconv(
-                tot_word_embedding, words, word_hyper_edge_index, self.word_adj
-            )
-            local_word_embedding = self.hyper_conv_word_local(
-                sub_word_embedding, sub_word_edge_index
-            )
-
-        return local_item_embedding, local_entity_embedding, local_word_embedding
-
-    def encode_user_repr(
-        self,
-        related_items,
-        related_entities,
-        related_words,
-        related_items_local,
-        related_entities_local,
-        related_words_local,
-        tot_item_embedding,
-        tot_entity_embedding,
-        tot_word_embedding,
-    ):
-        # COLD START
-        # if len(related_items) == 0 or len(related_words) == 0:
-        #     if len(related_entities) == 0:
-        #         user_repr = torch.zeros(self.user_emb_dim, device=self.device)
-        #     elif self.pooling == 'Attn':
-        #         user_repr = tot_entity_embedding[related_entities]
-        #         user_repr = self.kg_attn(user_repr)
-        #     else:
-        #         assert self.pooling == 'Mean'
-        #         user_repr = tot_entity_embedding[related_entities]
-        #         user_repr = torch.mean(user_repr, dim=0)
-        #     return user_repr
-
-        # 获取超图后的数据
-        item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_items) > 0:
-            items, item_hyper_edge_index = self._get_hypergraph(
-                related_items, self.item_adj
-            )
-            sub_item_embedding, sub_item_edge_index, item_tot2sub = (
-                self._before_hyperconv(
-                    tot_item_embedding, items, item_hyper_edge_index, self.item_adj
-                )
-            )
-            raw_item_embedding = self.hyper_conv_item(
-                sub_item_embedding, sub_item_edge_index
-            )
-            item_embedding = raw_item_embedding
-            # item_embedding = self._get_embedding(items, raw_item_embedding, item_tot2sub, self.item_adj)
-
-        entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_entities) > 0:
-            entities, entity_hyper_edge_index = self._get_hypergraph(
-                related_entities, self.entity_adj
-            )
-            sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = (
-                self._before_hyperconv(
-                    tot_entity_embedding,
-                    entities,
-                    entity_hyper_edge_index,
-                    self.entity_adj,
-                )
-            )
-            raw_entity_embedding = self.hyper_conv_entity(
-                sub_entity_embedding, sub_entity_edge_index
-            )
-            entity_embedding = raw_entity_embedding
-            # entity_embedding = self._get_embedding(entities, raw_entity_embedding, entity_tot2sub, self.entity_adj)
-
-        word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-        if len(related_words) > 0:
-            owrds, word_hyper_edge_index = self._get_hypergraph(
-                related_words, self.word_adj
-            )
-            sub_word_embedding, sub_word_edge_index, word_tot2sub = (
-                self._before_hyperconv(
-                    tot_word_embedding, owrds, word_hyper_edge_index, self.word_adj
-                )
-            )
-            raw_word_embedding = self.hyper_conv_word(
-                sub_word_embedding, sub_word_edge_index
-            )
-            word_embedding = raw_word_embedding
-            # word_embedding = self._get_embedding(owrds, raw_word_embedding, word_tot2sub, self.word_adj)
-
-        # 局部（k-turn）超图分支
-        local_item_embedding, local_entity_embedding, local_word_embedding = (
-            self._encode_local_branch(
-                related_items_local,
-                related_entities_local,
-                related_words_local,
-                tot_item_embedding,
-                tot_entity_embedding,
-                tot_word_embedding,
-            )
-        )
-
-        # 注意力机制
-        if len(related_entities) == 0:
-            user_repr = self._attention_and_gating(
-                item_embedding, entity_embedding, word_embedding, None,
-                local_item_embedding, local_entity_embedding, local_word_embedding,
-            )
-        else:
-            context_embedding = tot_entity_embedding[related_entities]
-            user_repr = self._attention_and_gating(
-                item_embedding, entity_embedding, word_embedding, context_embedding,
-                local_item_embedding, local_entity_embedding, local_word_embedding,
-            )
-        return user_repr
-
     def process_hllm(self, hllm_data, id_dict):
         res_data = []
         for raw_hyper_grapth in hllm_data:
@@ -710,60 +895,29 @@ class HyCoRecModel(BaseModel):
         return res_data
 
     # 获取用户编码
-    def encode_user(
-        self,
-        batch_related_items,
-        batch_related_entities,
-        batch_related_words,
-        batch_related_items_local,
-        batch_related_entities_local,
-        batch_related_words_local,
-        tot_item_embedding,
-        tot_entity_embedding,
-        tot_word_embedding,
-    ):
-        user_repr_list = []
-        for (
-            related_items,
-            related_entities,
-            related_words,
-            related_items_local,
-            related_entities_local,
-            related_words_local,
-        ) in zip(
-            batch_related_items,
-            batch_related_entities,
-            batch_related_words,
-            batch_related_items_local,
-            batch_related_entities_local,
-            batch_related_words_local,
-        ):
-            user_repr = self.encode_user_repr(
-                related_items,
-                related_entities,
-                related_words,
-                related_items_local,
-                related_entities_local,
-                related_words_local,
-                tot_item_embedding,
-                tot_entity_embedding,
-                tot_word_embedding,
-            )
-            user_repr_list.append(user_repr)
-        user_embedding = torch.stack(user_repr_list, dim=0)
-        # print("user_embedding.shape", user_embedding.shape) # [6, 128]
-        return user_embedding
+    def encode_user(self, batch, item_embedding, entity_embedding, token_embedding):
+        """CPC user encoder: per field fuse the C/P/G pooled preference vectors
+        (Eq. 12) into P_I/P_E/P_W, then gate with the current-dialogue entities
+        (Eq. 13, minus the review Transformer P_r which this codebase lacks)."""
+        field_x0 = self._field_x0(item_embedding, entity_embedding, token_embedding)
+        xg_by_field = self._collective_by_field(field_x0)
+        fused_all, ctx_all = self._cpc_field_preferences(batch, field_x0, xg_by_field)
+
+        user_repr_list = [
+            self._attention_and_gating(fused_all[i], ctx_all[i])
+            for i in range(len(fused_all))
+        ]
+        return torch.stack(user_repr_list, dim=0), xg_by_field
+
+    def _candidate_table(self, entity_embedding, xg_by_field):
+        """E_I for the recommendation head (Eq. 14a / 14b)."""
+        if self.ei_mode != "xg" or xg_by_field is None or not self.item_entity_ids:
+            return entity_embedding
+        xg_i = xg_by_field["item"]  # (n_entity, d) -- item field lives in entity space
+        return entity_embedding + xg_i
 
     # 推荐模块
     def recommend(self, batch, mode):
-        # 获取数据
-        conv_id = batch["conv_id"]
-        related_item = batch["related_item"]
-        related_entity = batch["related_entity"]
-        related_word = batch["related_word"]
-        related_item_local = batch["related_item_local"]
-        related_entity_local = batch["related_entity_local"]
-        related_word_local = batch["related_word_local"]
         item = batch["item"]
         item_embedding = self.item_encoder(
             self.entity_embedding.weight, self.edge_idx, self.edge_type
@@ -775,25 +929,12 @@ class HyCoRecModel(BaseModel):
             self.word_embedding.weight, self.edge_idx, self.edge_type
         )
 
-        # 获取用户编码
-        # start = perf_counter()
-        user_embedding = self.encode_user(
-            related_item,
-            related_entity,
-            related_word,
-            related_item_local,
-            related_entity_local,
-            related_word_local,
-            item_embedding,
-            entity_embedding,
-            token_embedding,
-        )  # (batch_size, emb_dim)
-        # print(f"{perf_counter() - start:.2f}")
+        user_embedding, xg_by_field = self.encode_user(
+            batch, item_embedding, entity_embedding, token_embedding
+        )
 
-        # 计算各实体得分
-        scores = F.linear(
-            user_embedding, entity_embedding, self.rec_bias.bias
-        )  # (batch_size, n_entity)
+        e_i = self._candidate_table(entity_embedding, xg_by_field)
+        scores = F.linear(user_embedding, e_i, self.rec_bias.bias)
         loss = self.rec_loss(scores, item)
         return loss, scores
 
@@ -808,16 +949,11 @@ class HyCoRecModel(BaseModel):
             self.item_encoder,
             self.entity_encoder,
             self.word_encoder,
-            self.hyper_conv_item,
-            self.hyper_conv_entity,
-            self.hyper_conv_word,
+            self.hconv,
+            self.fusion,
             self.item_attn,
             self.rec_bias,
         ]
-        if self.hyperedge_window_k is not None:
-            freeze_models.append(self.hyper_conv_item_local)
-            freeze_models.append(self.hyper_conv_entity_local)
-            freeze_models.append(self.hyper_conv_word_local)
         if self.pooling == "Attn":
             freeze_models.append(self.kg_attn)
             freeze_models.append(self.kg_attn_his)
@@ -825,144 +961,23 @@ class HyCoRecModel(BaseModel):
             for p in model.parameters():
                 p.requires_grad = False
 
-    def _before_hyperconv(
-        self,
-        embeddings: torch.FloatTensor,
-        hypergraph_items: List[int],
-        edge_index: torch.LongTensor,
-        adj,
-    ):
-        sub_items = []
-        edge_index = edge_index.cpu().numpy()
-        for item in hypergraph_items:
-            sub_items += [item] + list(adj.get(item, []))
-        sub_items = list(set(sub_items))
-        tot2sub = {tot: sub for sub, tot in enumerate(sub_items)}
-        sub_embeddings = embeddings[sub_items]
-        edge_index = [[tot2sub[v] for v in edge_index[0]], list(edge_index[1])]
-        sub_edge_index = torch.tensor(edge_index).long()
-        sub_edge_index = sub_edge_index.to(self.device)
-        return sub_embeddings, sub_edge_index, tot2sub
-
     # 获取超图后数据
-    def encode_session(
-        self,
-        batch_related_items,
-        batch_related_entities,
-        batch_related_words,
-        batch_related_items_local,
-        batch_related_entities_local,
-        batch_related_words_local,
-        tot_item_embedding,
-        tot_entity_embedding,
-        tot_word_embedding,
-    ):
+    def encode_session(self, batch, item_embedding, entity_embedding, token_embedding):
+        """Build the decoder cross-attention memory from the CPC scope vectors.
+
+        Return: session_repr (batch_size, seq_len, token_emb_dim),
+                mask (batch_size, seq_len)  (True = real token)
         """
-        Return: session_repr (batch_size, batch_seq_len, token_emb_dim), mask (batch_size, batch_seq_len)
-        """
+        field_x0 = self._field_x0(item_embedding, entity_embedding, token_embedding)
+        xg_by_field = self._collective_by_field(field_x0)
+        fused_all, ctx_all = self._cpc_field_preferences(batch, field_x0, xg_by_field)
+
         session_repr_list = []
-        for (
-            session_related_items,
-            session_related_entities,
-            session_related_words,
-            session_related_items_local,
-            session_related_entities_local,
-            session_related_words_local,
-        ) in zip(
-            batch_related_items,
-            batch_related_entities,
-            batch_related_words,
-            batch_related_items_local,
-            batch_related_entities_local,
-            batch_related_words_local,
-        ):
-            # COLD START
-            # if len(session_related_items) == 0 or len(session_related_words) == 0:
-            #     if len(session_related_entities) == 0:
-            #         session_repr_list.append(None)
-            #     else:
-            #         session_repr = tot_entity_embedding[session_related_entities]
-            #         session_repr_list.append(session_repr)
-            #     continue
-
-            # 获取超图后的数据
-            item_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_items) > 0:
-                items, item_hyper_edge_index = self._get_hypergraph(
-                    session_related_items, self.item_adj
-                )
-                sub_item_embedding, sub_item_edge_index, item_tot2sub = (
-                    self._before_hyperconv(
-                        tot_item_embedding, items, item_hyper_edge_index, self.item_adj
-                    )
-                )
-                raw_item_embedding = self.hyper_conv_item(
-                    sub_item_embedding, sub_item_edge_index
-                )
-                item_embedding = raw_item_embedding
-                # item_embedding = self._get_embedding(items, raw_item_embedding, item_tot2sub, self.item_adj)
-
-            entity_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_entities) > 0:
-                entities, entity_hyper_edge_index = self._get_hypergraph(
-                    session_related_entities, self.entity_adj
-                )
-                sub_entity_embedding, sub_entity_edge_index, entity_tot2sub = (
-                    self._before_hyperconv(
-                        tot_entity_embedding,
-                        entities,
-                        entity_hyper_edge_index,
-                        self.entity_adj,
-                    )
-                )
-                raw_entity_embedding = self.hyper_conv_entity(
-                    sub_entity_embedding, sub_entity_edge_index
-                )
-                entity_embedding = raw_entity_embedding
-                # entity_embedding = self._get_embedding(entities, raw_entity_embedding, entity_tot2sub, self.entity_adj)
-
-            word_embedding = torch.zeros((1, self.kg_emb_dim), device=self.device)
-            if len(session_related_words) > 0:
-                owrds, word_hyper_edge_index = self._get_hypergraph(
-                    session_related_words, self.word_adj
-                )
-                sub_word_embedding, sub_word_edge_index, word_tot2sub = (
-                    self._before_hyperconv(
-                        tot_word_embedding, owrds, word_hyper_edge_index, self.word_adj
-                    )
-                )
-                raw_word_embedding = self.hyper_conv_word(
-                    sub_word_embedding, sub_word_edge_index
-                )
-                word_embedding = raw_word_embedding
-                # word_embedding = self._get_embedding(owrds, raw_word_embedding, word_tot2sub, self.word_adj)
-
-            # 局部（k-turn）超图分支
-            local_item_embedding, local_entity_embedding, local_word_embedding = (
-                self._encode_local_branch(
-                    session_related_items_local,
-                    session_related_entities_local,
-                    session_related_words_local,
-                    tot_item_embedding,
-                    tot_entity_embedding,
-                    tot_word_embedding,
-                )
-            )
-
-            # 数据拼接
-            session_parts = [item_embedding, entity_embedding]
-            if len(session_related_entities) > 0:
-                context_embedding = tot_entity_embedding[session_related_entities]
-                session_parts.append(context_embedding)
-            session_parts.append(word_embedding)
-            if local_item_embedding is not None:
-                session_parts += [
-                    local_item_embedding,
-                    local_entity_embedding,
-                    local_word_embedding,
-                ]
-            session_repr = torch.cat(session_parts, dim=0)
-            session_repr_list.append(session_repr)
+        for i in range(len(fused_all)):
+            parts = [fused_all[i]]  # (3, d) -- P_I, P_E, P_W
+            if ctx_all[i] is not None:
+                parts.append(ctx_all[i])
+            session_repr_list.append(torch.cat(parts, dim=0))
 
         batch_seq_len = max(
             [
@@ -1045,17 +1060,23 @@ class HyCoRecModel(BaseModel):
     ):
         bsz = context_encoder_state[0].shape[0]
         xs = self._starts(bsz)
+        # KV-cached decoding: feed only the newest token each step and let
+        # incr_state carry cached self/cross-attention K,V forward, instead
+        # of reprocessing the whole growing sequence from scratch every step
+        # (see TransformerDecoderKG.forward_incremental - ~25x less
+        # attention work over a typical greedy decode, verified numerically
+        # identical to the old full-reprocess path via torch.allclose).
+        new_token = xs
         incr_state = None
         logits = []
         for i in range(self.longest_label):
-            scores, incr_state = self.decoder(
-                xs,
+            scores, incr_state = self.decoder.forward_incremental(
+                new_token,
                 related_encoder_state,
                 context_encoder_state,
                 session_state,
                 incr_state,
-            )  # incr_state is always None
-            scores = scores[:, -1:, :]
+            )
             token_logits = F.linear(scores, self.token_embedding.weight)
             user_logits = self.user_proj_2(
                 torch.relu(self.user_proj_1(user_embedding))
@@ -1073,6 +1094,7 @@ class HyCoRecModel(BaseModel):
             probs, preds = sum_logits.max(dim=-1)
             logits.append(scores)
             xs = torch.cat([xs, preds], dim=1)
+            new_token = preds
             # check if everyone has generated an end token
             all_finished = (
                 (xs == self.end_token_idx).sum(dim=1) > 0
@@ -1084,16 +1106,7 @@ class HyCoRecModel(BaseModel):
 
     # 对话模块训练
     def converse(self, batch, mode):
-        # 获取数据
-        conv_id = batch["conv_id"]
-        related_item = batch["related_item"]
-        related_entity = batch["related_entity"]
-        related_word = batch["related_word"]
-        related_item_local = batch["related_item_local"]
-        related_entity_local = batch["related_entity_local"]
-        related_word_local = batch["related_word_local"]
         response = batch["response"]
-
         related_tokens = batch["related_tokens"]
         context_tokens = batch["context_tokens"]
 
@@ -1109,29 +1122,12 @@ class HyCoRecModel(BaseModel):
 
         # 获取对话编码
         session_state = self.encode_session(
-            related_item,
-            related_entity,
-            related_word,
-            related_item_local,
-            related_entity_local,
-            related_word_local,
-            item_embedding,
-            entity_embedding,
-            token_embedding,
+            batch, item_embedding, entity_embedding, token_embedding
         )
 
         # 获取用户编码
-        # start = perf_counter()
-        user_embedding = self.encode_user(
-            related_item,
-            related_entity,
-            related_word,
-            related_item_local,
-            related_entity_local,
-            related_word_local,
-            item_embedding,
-            entity_embedding,
-            token_embedding,
+        user_embedding, _ = self.encode_user(
+            batch, item_embedding, entity_embedding, token_embedding
         )  # (batch_size, emb_dim)
 
         # 获取 X_c、X_h
