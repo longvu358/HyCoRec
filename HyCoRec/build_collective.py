@@ -13,17 +13,26 @@ Usage::
     python build_collective.py -d hredial            # or htgredial
     python build_collective.py -d hredial --tokenize nltk
 
-Output: ``data/collective/<dataset>/A_hat_{item,entity,word}.npz`` (+ ``stats.json``).
+Output: ``data/collective/<dataset>/A_hat_{item,entity,word}.npz`` (+ ``stats.json``,
+``tail_items.json``) -- "G0" in the ablation ladder (dialogue hyperedges only).
 
-Review / aspect-centric hyperedges (spec Eq. 4-5) are Branch 2 and are added by
-re-running this with ``--review-index <path>`` once that index exists.
+With ``--with_review`` / ``--with_aspect`` (needs ``build_review_index.py``
+run first), also adds the review-hypergraph ``H^{G,rev}_E`` (Eq. 4/6, one
+hyperedge per reviewed item = {item} u its top review entities, field E) and/or
+the aspect-centric ``H^{G,asp}_I`` (Eq. 5/7, one hyperedge per salient entity
+= the items whose reviews rank it highest, field I). ``--use_review`` is
+shorthand for both together ("G" full in the ablation ladder; either flag
+alone is A6/A7's "G0 + one of the two"). Written to a separate
+``<dataset>_{review,aspect,full}`` directory so the G0-only artifacts used by
+A0/A3 configs are untouched; point a config's ``collective_path`` at
+whichever one that ablation needs.
 """
 
 import argparse
 import json
 import os
 import pickle
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import scipy.sparse as sp
@@ -72,6 +81,38 @@ def _tail_items(item_hyperedges, item_universe):
     return tail, freq
 
 
+def _review_hyperedges(review_index):
+    """H^{G,rev}_E (Eq. 4/6): {i} u E_top^+(R_i), one hyperedge per item that
+    has review data. ``review_index``: {item_id(str): [[entity_id, tf], ...]}."""
+    edges = []
+    for item_id_str, pairs in review_index.items():
+        members = sorted({int(item_id_str)} | {eid for eid, _ in pairs})
+        if len(members) >= 2:
+            edges.append(members)
+    return edges
+
+
+def _aspect_hyperedges(review_index, m_min, k_asp):
+    """H^{G,asp}_I (Eq. 5/7): for each aspect entity c with df(c) >= m_min,
+    one hyperedge = Top-k_asp items by tf^+(c,i). Returns (edges, df)."""
+    item_tf_by_entity = defaultdict(dict)
+    for item_id_str, pairs in review_index.items():
+        item_id = int(item_id_str)
+        for eid, tf in pairs:
+            item_tf_by_entity[eid][item_id] = tf
+
+    df = {c: len(items) for c, items in item_tf_by_entity.items()}
+    edges = []
+    for c, items in item_tf_by_entity.items():
+        if df[c] < m_min:
+            continue
+        ranked = sorted(items.items(), key=lambda kv: kv[1], reverse=True)[:k_asp]
+        members = [i for i, _ in ranked]
+        if len(members) >= 2:
+            edges.append(members)
+    return edges, df
+
+
 def _incidence(hyperedges, n_nodes):
     rows, cols = [], []
     for j, members in enumerate(hyperedges):
@@ -88,6 +129,36 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-d", "--dataset", required=True, choices=list(DEFAULT_TOKENIZE))
     ap.add_argument("--tokenize", default=None)
+    ap.add_argument(
+        "--use_review",
+        action="store_true",
+        help="shorthand for --with_review --with_aspect (ablation A8/A9: 'G' full).",
+    )
+    ap.add_argument(
+        "--with_review",
+        action="store_true",
+        help="add H^{G,rev}_E (Eq. 4/6, field E) from build_review_index.py's output "
+        "(ablation A6: G0 + h^rev,G).",
+    )
+    ap.add_argument(
+        "--with_aspect",
+        action="store_true",
+        help="add H^{G,asp}_I (Eq. 5/7, field I) from build_review_index.py's output "
+        "(ablation A7: G0 + h^asp).",
+    )
+    ap.add_argument(
+        "--review_index",
+        default=None,
+        help="path to review_index.json; default data/reviews/<dataset>/review_index.json",
+    )
+    ap.add_argument("--m_min", type=int, default=3, help="aspect-centric Eq. 5: df(c) >= m_min")
+    ap.add_argument("--k_asp", type=int, default=50, help="aspect-centric Eq. 5: Top-k_asp items per aspect")
+    ap.add_argument(
+        "--out_dir",
+        default=None,
+        help="output dir; default data/collective/<dataset> (G0) or "
+        "data/collective/<dataset>_full (--use_review)",
+    )
     args = ap.parse_args()
 
     tokenize = args.tokenize or DEFAULT_TOKENIZE[args.dataset]
@@ -109,11 +180,42 @@ def main():
 
     print(f"[{args.dataset}] {len(groups)} groups -> extracting dialogue hyperedges ...")
     edges, n_conv = _dialogue_hyperedges(groups, tok2ind, entity2id, unk_idx)
+    n_dlg = {f: len(edges[f]) for f in edges}
 
-    out_dir = os.path.join(DATA_PATH, "collective", args.dataset)
+    with_review = args.with_review or args.use_review
+    with_aspect = args.with_aspect or args.use_review
+
+    review_index = None
+    if with_review or with_aspect:
+        review_index_path = args.review_index or os.path.join(
+            DATA_PATH, "reviews", args.dataset, "review_index.json"
+        )
+        with open(review_index_path, encoding="utf-8") as f:
+            review_index = json.load(f)
+        if with_review:
+            review_edges = _review_hyperedges(review_index)
+            edges["entity"] = edges["entity"] + review_edges
+            print(f"[{args.dataset}] +{len(review_edges)} review hyperedges (field E, Eq. 4/6) from {review_index_path}")
+        if with_aspect:
+            aspect_edges, df = _aspect_hyperedges(review_index, args.m_min, args.k_asp)
+            edges["item"] = edges["item"] + aspect_edges
+            print(
+                f"[{args.dataset}] +{len(aspect_edges)} aspect hyperedges (field I, Eq. 5/7, "
+                f"m_min={args.m_min}, k_asp={args.k_asp}, {sum(1 for v in df.values() if v >= args.m_min)}"
+                f"/{len(df)} candidate aspects pass df>=m_min)"
+            )
+
+    suffix = "_full" if (with_review and with_aspect) else "_review" if with_review else "_aspect" if with_aspect else ""
+    out_dir = args.out_dir or os.path.join(DATA_PATH, "collective", args.dataset + suffix)
     os.makedirs(out_dir, exist_ok=True)
 
-    stats = {"n_train_conversations": n_conv, "tokenize": tokenize, "fields": {}}
+    stats = {
+        "n_train_conversations": n_conv,
+        "tokenize": tokenize,
+        "with_review": with_review,
+        "with_aspect": with_aspect,
+        "fields": {},
+    }
     for field in ("item", "entity", "word"):
         he = edges[field]
         incidence = _incidence(he, n_nodes[field])
@@ -122,6 +224,8 @@ def main():
         sizes = Counter(len(h) for h in he)
         stats["fields"][field] = {
             "n_hyperedges": len(he),
+            "n_dialogue_hyperedges": n_dlg[field],
+            "n_review_or_aspect_hyperedges": len(he) - n_dlg[field],
             "n_nodes": n_nodes[field],
             "a_hat_nnz": int(a_hat.nnz),
             "edge_size_min": min(sizes) if sizes else 0,
@@ -131,14 +235,18 @@ def main():
             ),
         }
         print(
-            f"  {field:6s}: {len(he):6d} hyperedges | Â nnz={a_hat.nnz:>9d} "
+            f"  {field:6s}: {len(he):6d} hyperedges ({n_dlg[field]} dlg + "
+            f"{len(he) - n_dlg[field]} rev/asp) | Â nnz={a_hat.nnz:>9d} "
             f"| |h| mean={stats['fields'][field]['edge_size_mean']}"
         )
 
     item_universe = side_data.get("item_entity_ids") or sorted(
-        {v for h in edges["item"] for v in h}
+        {v for h in edges["item"][: n_dlg["item"]] for v in h}
     )
-    tail_items, freq = _tail_items(edges["item"], item_universe)
+    # deg_dlg is always computed from dialogue hyperedges only (checklist §4.1
+    # step 7's Matthew-effect stat is specifically about the review signal
+    # reaching items dialogue alone never touches).
+    tail_items, freq = _tail_items(edges["item"][: n_dlg["item"]], item_universe)
     with open(os.path.join(out_dir, "tail_items.json"), "w", encoding="utf-8") as f:
         json.dump(tail_items, f)
     n_unseen = sum(1 for i in item_universe if freq.get(i, 0) == 0)
@@ -152,6 +260,16 @@ def main():
         f"  tail  : {len(tail_items)}/{len(item_universe)} items "
         f"({n_unseen} never mentioned in train) -> tail_items.json"
     )
+
+    if review_index is not None:
+        n_saved = sum(
+            1 for i in item_universe if freq.get(i, 0) == 0 and str(i) in review_index
+        )
+        stats["tail"]["n_tail_saved_by_review"] = n_saved
+        print(
+            f"  matthew: {n_saved}/{n_unseen} items with zero dialogue mentions "
+            f"gain a review hyperedge anyway (deg_dlg=0, deg_rev>0)"
+        )
 
     with open(os.path.join(out_dir, "stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)

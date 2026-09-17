@@ -395,6 +395,12 @@ class HyCoRecModel(BaseModel):
         self.ei_mode = opt.get("ei_mode", "xg")  # base | xg  (Eq. 14a / 14b)
         self.item_entity_ids = list(side_data.get("item_entity_ids", []))
         self.collective = None
+        # Branch 2: review-hypergraph in scope P, field E (Eq. 1r/1s). Scope G's
+        # review + aspect hyperedges (Eq. 4/6, 5/7) are baked into Â^G_{E,I}
+        # offline by build_collective.py --use_review; nothing to load here for G.
+        self.use_review_hypergraph = opt.get("use_review_hypergraph", False)
+        self.review_index_path = opt.get("review_index_path", None)
+        self.review_index = None
         self.pretrain = opt.get("pretrain", False)
         self.pretrain_data = None
         self.pretrain_epoch = opt.get("pretrain_epoch", 9999)
@@ -421,6 +427,32 @@ class HyCoRecModel(BaseModel):
         self._build_recommendation_layer()
         self._build_conversation_layer()
         self._load_collective()
+        self._load_review_index()
+
+    def _load_review_index(self):
+        """E_top^+(R_i) per item, precomputed by build_review_index.py
+        (spec 1.3/4.1). Only used by scope P, field E (Eq. 1r/1s); scope G's
+        review/aspect hyperedges are already baked into Â^G_{E,I}."""
+        if not self.use_review_hypergraph:
+            return
+        path = self.review_index_path or os.path.join(
+            DATA_PATH, "reviews", self.dataset.lower(), "review_index.json"
+        )
+        if not os.path.isfile(path):
+            logger.warning(
+                f"[CPC] use_review_hypergraph=true but no review_index.json at {path}; "
+                "run build_review_index.py. Disabling review-hypergraph in scope P."
+            )
+            self.use_review_hypergraph = False
+            return
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        # {item_id(int): [entity_id, ...]} -- tf counts (Eq. 1r/1s only needs
+        # the top-k set itself, not the ranking used to build it)
+        self.review_index = {
+            int(item_id): [eid for eid, _tf in pairs] for item_id, pairs in raw.items()
+        }
+        logger.info(f"[CPC] loaded review index ({len(self.review_index)} items) from {path}")
 
     def _load_collective(self):
         self.n_word = max(self.token2id.values()) + 1
@@ -774,14 +806,18 @@ class HyCoRecModel(BaseModel):
             return torch.zeros(self.kg_emb_dim, device=self.device)
         return xg[rows].mean(dim=0)
 
-    def _personal_hyperedges(self, field, hist_field_sessions):
+    def _personal_hyperedges(self, field, hist_field_sessions, item_sessions=None):
         """H^P_f node sets + the readout node set Q^P_f.
 
         * field ``item``  -> one hyperedge per historical session (its item set),
           no expansion (spec Eq. 1, ``H^P_I``).
         * field ``entity`` / ``word`` -> one star hyperedge ``{v} u N^(k)(v)`` per
           node ``v`` mentioned across the historical sessions, expanded k-hop over
-          the corresponding auxiliary KG (``entity_adj`` / ``word_adj``).
+          the corresponding auxiliary KG (``entity_adj`` / ``word_adj``). For
+          field ``entity`` with the review-hypergraph enabled, also appends
+          ``{i} u E_top^+(R_i)`` for every historical item ``i`` (Eq. 1r),
+          nested into the same incidence as the KG-expansion (Eq. 1s: N^P_E
+          = [N^{P,KG}_E | N^{P,rev}_E], one shared HConv call for both).
         """
         if field == "item":
             edges = [sorted(s) for s in hist_field_sessions if s]
@@ -790,6 +826,13 @@ class HyCoRecModel(BaseModel):
         seeds = sorted({v for s in hist_field_sessions for v in s})
         adj = self._field_adj(field)
         edges = [sorted(khop_closure([v], adj, self.k_hop)) for v in seeds]
+        if field == "entity" and self.use_review_hypergraph and self.review_index and item_sessions:
+            i_p = sorted({v for s in item_sessions for v in s})
+            edges += [
+                sorted({i} | set(self.review_index[i]))
+                for i in i_p
+                if self.review_index.get(i)
+            ]
         q = sorted({v for e in edges for v in e})
         return edges, q
 
@@ -822,7 +865,9 @@ class HyCoRecModel(BaseModel):
                 p_used_history = has_history and "P" in self.scopes
                 if p_used_history:
                     p_edges, q_p = self._personal_hyperedges(
-                        field, batch[f"history_session_{field}"][b]
+                        field,
+                        batch[f"history_session_{field}"][b],
+                        item_sessions=batch["history_session_item"][b],
                     )
                     xp, mp = self._scope_hconv(p_edges, field, x0, exclude=target)
                     p_p = self._pool_local(xp, mp, q_p)
