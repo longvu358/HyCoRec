@@ -43,12 +43,17 @@ review_index_path: null       # null -> data/reviews/<dataset>/review_index.json
 rec:
   epoch: 5
   batch_size: 64
-  early_stop: False
-  stop_mode: min
-  impatience: 2
+  early_stop: True
+  stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
+  impatience: 3
   optimizer:
     name: Adam
-    lr: !!float 1e-3
+    lr: !!float 5e-4
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    mode: max   # recall@50 is maximized, unlike conv's gen_loss
+    patience: 1
+    factor: 0.5
 conv:
   epoch: 1
   batch_size: 128

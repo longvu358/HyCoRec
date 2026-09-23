@@ -1,4 +1,5 @@
-# Ablation A9 (CPC-Hypergraph v2.1, spec 6.2) -- C + P+R + G full -- FULL MODEL, milestone deliverable, (14b)
+# Ablation A3b (CPC-Hypergraph v2, spec 6.2) -- derived from redial.yaml
+# [rtx6000 profile] batch_size x4 vs base ablation config for a 96GB GPU (see config/crs/hycorec/ablation/A3b.yaml)
 # dataset
 dataset: HReDial
 tokenize: nltk
@@ -27,22 +28,20 @@ user_proj_dim: 512
 mha_n_heads: 4
 pooling: Mean
 extension_strategy: Adaptive
-# CPC-Hypergraph v2 (docs/contexual_personal_collective) — full model, A9 milestone
-scopes: [C, P, G]
+# CPC-Hypergraph v2 (docs/contexual_personal_collective) — full model (~A9 minus review)
+scopes: [P, G]
 k_hist: 40
 k_hop: 1
-context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
+context_window_w: 3
 hconv_layers: 2
 alpha_init: [-1, 0, -1]
 ei_mode: xg
 freeze_alpha: false
-collective_path: data/collective/hredial_full
-use_review_hypergraph: true
-review_index_path: null       # null -> data/reviews/<dataset>/review_index.json
+collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
-  epoch: 5
-  batch_size: 64
+  epoch: 2
+  batch_size: 256
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
   impatience: 3
@@ -56,7 +55,7 @@ rec:
     factor: 0.5
 conv:
   epoch: 1
-  batch_size: 128
+  batch_size: 512
   impatience: 1
   optimizer:
     name: Adam

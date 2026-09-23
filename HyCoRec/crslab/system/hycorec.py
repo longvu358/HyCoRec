@@ -142,9 +142,12 @@ class HyCoRecSystem(BaseSystem):
                     self.step(batch, stage='rec', mode='valid')
                 self.evaluator.report(epoch=epoch, mode='valid')
                 # early stop
-                metric = self.evaluator.optim_metrics['rec_loss']
+                metric = self.evaluator.rec_metrics['recall@50']
+                self.adjust_lr(metric)
                 if self.early_stop(metric):
                     break
+        if self.need_early_stop:
+            self.restore_model()
         # test
         logger.info('[Test]')
         with torch.no_grad():
@@ -152,6 +155,8 @@ class HyCoRecSystem(BaseSystem):
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 self.step(batch, stage='rec', mode='test')
             self.evaluator.report(mode='test')
+        fusion = getattr(self.model, 'module', self.model).fusion
+        logger.info(f'[Scope fusion weights alpha_f] {fusion.weight_table()}')
 
     def train_conversation(self):
         if os.environ["CUDA_VISIBLE_DEVICES"] == '-1':
@@ -176,6 +181,7 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.report(epoch=epoch, mode='valid')
                 # early stop
                 metric = self.evaluator.optim_metrics['gen_loss']
+                self.adjust_lr(metric)
                 if self.early_stop(metric):
                     break
         # test
