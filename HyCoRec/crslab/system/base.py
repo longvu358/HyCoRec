@@ -57,10 +57,9 @@ class BaseSystem(ABC):
         self.opt = opt
         if opt["gpu"] == [-1]:
             self.device = torch.device('cpu')
-        elif len(opt["gpu"]) == 1:
-            self.device = torch.device('cuda')
         else:
-            self.device = torch.device('cpu')
+            # multi-GPU: DataParallel requires the master copy on device_ids[0]
+            self.device = torch.device('cuda:0')
         # seed
         if 'seed' in opt:
             seed = int(opt['seed'])

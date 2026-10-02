@@ -1,0 +1,28 @@
+name: hycorec
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - pyarrow
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - requests
+  - tqdm
+  - loguru
+  - nltk
+  - ijson
+  - pytest
+  - ruff
+  - pip:
+      # cu126 build keeps kernels for sm_60 (P100) and sm_70 (V100); cu130 dropped them.
+      - --index-url https://pypi.org/simple
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.14.1+cu126
+      - torch-geometric>=2.6.1
+      - transformers>=4.55.0
