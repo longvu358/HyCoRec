@@ -40,7 +40,7 @@ freeze_alpha: false
 collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
-  epoch: 2
+  epoch: 10
   batch_size: 64
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
@@ -54,7 +54,7 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 1
+  epoch: 4
   batch_size: 128
   impatience: 1
   optimizer:

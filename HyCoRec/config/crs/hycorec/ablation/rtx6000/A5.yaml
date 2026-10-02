@@ -1,5 +1,5 @@
 # Ablation A5 (CPC-Hypergraph v2.1, spec 6.2) -- P + review-hypergraph (Eq. 1r/1s), C/G off, (14a)
-# [rtx6000 profile] batch_size x4 vs base ablation config for a 96GB GPU (see config/crs/hycorec/ablation/A5.yaml)
+# [rtx6000 profile] identical to base ablation/A5.yaml except batch_size x2 (16GB GPU: V100/P100)
 # dataset
 dataset: HReDial
 tokenize: nltk
@@ -43,8 +43,8 @@ use_review_hypergraph: true
 review_index_path: null       # null -> data/reviews/<dataset>/review_index.json
 # optim
 rec:
-  epoch: 5
-  batch_size: 256
+  epoch: 10
+  batch_size: 128
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
   impatience: 3
@@ -57,8 +57,8 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 5
-  batch_size: 512
+  epoch: 4
+  batch_size: 256
   impatience: 1
   optimizer:
     name: Adam

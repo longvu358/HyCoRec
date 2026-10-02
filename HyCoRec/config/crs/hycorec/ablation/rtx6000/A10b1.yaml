@@ -1,5 +1,5 @@
 # Ablation A10b1 (CPC-Hypergraph v2, spec 6.2) -- derived from redial.yaml
-# [rtx6000 profile] batch_size x4 vs base ablation config for a 96GB GPU (see config/crs/hycorec/ablation/A10b1.yaml)
+# [rtx6000 profile] identical to base ablation/A10b1.yaml except batch_size x2 (16GB GPU: V100/P100)
 # dataset
 dataset: HReDial
 tokenize: nltk
@@ -42,7 +42,7 @@ collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
   epoch: 10
-  batch_size: 256
+  batch_size: 128
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
   impatience: 3
@@ -55,8 +55,8 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 5
-  batch_size: 512
+  epoch: 4
+  batch_size: 256
   impatience: 1
   optimizer:
     name: Adam

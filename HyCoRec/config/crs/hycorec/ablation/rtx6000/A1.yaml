@@ -1,5 +1,5 @@
 # Ablation A1 (CPC-Hypergraph v2.1, spec 6.2) -- P + C, sliding window w=3 (Eq. 2)
-# [rtx6000 profile] batch_size x4 vs base ablation config for a 96GB GPU (see config/crs/hycorec/ablation/A1.yaml)
+# [rtx6000 profile] identical to base ablation/A1.yaml except batch_size x2 (16GB GPU: V100/P100)
 # dataset
 dataset: HReDial
 tokenize: nltk
@@ -41,8 +41,8 @@ freeze_alpha: false
 collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
-  epoch: 3
-  batch_size: 64
+  epoch: 10
+  batch_size: 32
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
   impatience: 3
@@ -55,8 +55,8 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 5
-  batch_size: 64
+  epoch: 4
+  batch_size: 32
   impatience: 1
   optimizer:
     name: Adam
