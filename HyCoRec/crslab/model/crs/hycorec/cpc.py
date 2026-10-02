@@ -126,16 +126,27 @@ class CollectivePropagation:
 
     def __init__(self, a_hat):
         self.a_hat = a_hat  # {field: torch.sparse_coo_tensor (n_f x n_f)}
+        self._replicas = {}  # (field, device) -> copy for DataParallel replicas
 
     def to(self, device):
         self.a_hat = {f: m.to(device) for f, m in self.a_hat.items()}
+        self._replicas = {}
         return self
+
+    def _on(self, field, device):
+        a = self.a_hat[field]
+        if a.device == device:
+            return a
+        key = (field, device)
+        if key not in self._replicas:
+            self._replicas[key] = a.to(device)
+        return self._replicas[key]
 
     def run(self, field, x0, hconv_layers):
         """``x0``: (n_f, d) initial embeddings. ``hconv_layers``: iterable of
         ``CustomHypergraphConv`` (their ``.lin`` weight + ``.bias`` are reused)."""
         x = x0
-        a = self.a_hat[field]
+        a = self._on(field, x0.device)
         for layer in hconv_layers:
             x = torch.sparse.mm(a, layer.lin(x))
             if layer.bias is not None:
