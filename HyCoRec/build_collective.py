@@ -113,6 +113,105 @@ def _aspect_hyperedges(review_index, m_min, k_asp):
     return edges, df
 
 
+def _unified_dialogue_hyperedges(groups, tok2ind, entity2id, unk_idx, n_entity, k_w):
+    """v2.2 Eq. 3: one hyperedge per distinct training conversation over
+    V^G = V_E u V_W, h_d = V_I(d) u V_E(d) u (V_W(d) + n_E). Items are a subset
+    of V_E so share the entity index space. ``k_w`` (or None) caps the words
+    kept per h_d, preferring the rarest ones (highest idf)."""
+    seen, convs = set(), []
+    for group in groups:
+        for conv in group:
+            cid = int(conv["conv_id"])
+            if cid in seen:
+                continue
+            seen.add(cid)
+            turns = merge_conv_turns(conv["dialog"], tok2ind, entity2id, unk_idx)
+            items, entities, words = session_node_sets(turns)
+            convs.append((set(items) | set(entities), set(words)))
+    w_df = Counter(w for _, ws in convs for w in ws)
+    edges, n_word_total, n_word_kept = [], 0, 0
+    for ents, words in convs:
+        n_word_total += len(words)
+        if k_w is not None and len(words) > k_w:
+            words = sorted(words, key=lambda w: (w_df[w], w))[:k_w]
+        n_word_kept += len(words)
+        members = sorted(ents | {w + n_entity for w in words})
+        if len(members) >= 2:
+            edges.append(members)
+    return edges, len(seen), n_word_total, n_word_kept
+
+
+def _size_hist(edges):
+    sizes = np.array([len(h) for h in edges]) if edges else np.zeros(1)
+    return {
+        "n": len(edges),
+        "min": int(sizes.min()),
+        "p50": float(np.percentile(sizes, 50)),
+        "p90": float(np.percentile(sizes, 90)),
+        "max": int(sizes.max()),
+        "mean": round(float(sizes.mean()), 2),
+    }
+
+
+def _build_unified(args, groups, tok2ind, entity2id, side_data, n_entity, n_word, unk_idx):
+    """v2.2 scope G: ONE hypergraph on V^G (Eq. 6-7) -> A_hat_G.npz."""
+    n_g = n_entity + n_word
+    dlg, n_conv, w_total, w_kept = _unified_dialogue_hyperedges(
+        groups, tok2ind, entity2id, unk_idx, n_entity, args.k_w_dlg
+    )
+    parts = {"dlg": dlg, "rev": [], "asp": []}
+    review_index = None
+    if args.with_review or args.with_aspect or args.use_review:
+        path = args.review_index or os.path.join(
+            DATA_PATH, "reviews", args.dataset, "review_index.json"
+        )
+        with open(path, encoding="utf-8") as f:
+            review_index = json.load(f)
+        if args.with_review or args.use_review:
+            parts["rev"] = _review_hyperedges(review_index)
+        if args.with_aspect or args.use_review:
+            parts["asp"], _ = _aspect_hyperedges(review_index, args.m_min, args.k_asp)
+    all_edges = parts["dlg"] + parts["rev"] + parts["asp"]
+    incidence = _incidence(all_edges, n_g)
+    a_hat = a_hat_from_incidence(incidence).tocsr()
+
+    suffix = "_unified" + ("_full" if review_index is not None and args.use_review else "")
+    out_dir = args.out_dir or os.path.join(DATA_PATH, "collective", args.dataset + suffix)
+    os.makedirs(out_dir, exist_ok=True)
+    sp.save_npz(os.path.join(out_dir, "A_hat_G.npz"), a_hat)
+
+    item_universe = side_data.get("item_entity_ids") or []
+    deg = np.asarray(incidence.tocsr().sum(axis=1)).ravel()
+    n_dlg_item = Counter(v for h in parts["dlg"] for v in h if v < n_entity)
+    n_rev_item = Counter(v for h in parts["rev"] + parts["asp"] for v in h if v < n_entity)
+    n_tail = sum(1 for i in item_universe if n_dlg_item.get(i, 0) == 0 and n_rev_item.get(i, 0) > 0)
+    stats = {
+        "mode": "unified",
+        "n_train_conversations": n_conv,
+        "n_entity": n_entity,
+        "n_word": n_word,
+        "n_G": n_g,
+        "word_offset": n_entity,
+        "k_w_dlg": args.k_w_dlg,
+        "word_share_in_h_d": round(
+            sum(1 for h in parts["dlg"] for v in h if v >= n_entity)
+            / max(1, sum(len(h) for h in parts["dlg"])), 3,
+        ),
+        "words_per_conv_before_cap": round(w_total / max(1, n_conv), 1),
+        "words_per_conv_after_cap": round(w_kept / max(1, n_conv), 1),
+        "hyperedges": {k: _size_hist(v) for k, v in parts.items()},
+        "a_hat_nnz": int(a_hat.nnz),
+        "a_hat_density": float(a_hat.nnz) / (n_g * n_g),
+        "n_isolated_nodes": int((deg == 0).sum()),
+        "n_tail_saved_by_review": n_tail,
+        "n_items": len(item_universe),
+    }
+    with open(os.path.join(out_dir, "stats.json"), "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+    print(json.dumps(stats, indent=2))
+    print(f"[done] unified Â^G ({n_g}x{n_g}, nnz={a_hat.nnz}) -> {out_dir}")
+
+
 def _incidence(hyperedges, n_nodes):
     rows, cols = [], []
     for j, members in enumerate(hyperedges):
@@ -154,6 +253,19 @@ def main():
     ap.add_argument("--m_min", type=int, default=3, help="aspect-centric Eq. 5: df(c) >= m_min")
     ap.add_argument("--k_asp", type=int, default=50, help="aspect-centric Eq. 5: Top-k_asp items per aspect")
     ap.add_argument(
+        "--unified",
+        action="store_true",
+        help="v2.2: build ONE Â^G over V^G=V_E u V_W (word ids offset by n_E), "
+        "written as A_hat_G.npz, instead of three per-field matrices.",
+    )
+    ap.add_argument(
+        "--k_w_dlg",
+        type=int,
+        default=None,
+        help="--unified only: max words per dialogue hyperedge h_d (rarest kept); "
+        "default uncapped. Inspect stats.json word_share_in_h_d first.",
+    )
+    ap.add_argument(
         "--out_dir",
         default=None,
         help="output dir; default data/collective/<dataset> (G0) or "
@@ -177,6 +289,10 @@ def main():
     n_word = max(tok2ind.values()) + 1
     n_nodes = {"item": n_entity, "entity": n_entity, "word": n_word}
     unk_idx = tok2ind.get("__unk__", 3)
+
+    if args.unified:
+        _build_unified(args, groups, tok2ind, entity2id, side_data, n_entity, n_word, unk_idx)
+        return
 
     print(f"[{args.dataset}] {len(groups)} groups -> extracting dialogue hyperedges ...")
     edges, n_conv = _dialogue_hyperedges(groups, tok2ind, entity2id, unk_idx)
