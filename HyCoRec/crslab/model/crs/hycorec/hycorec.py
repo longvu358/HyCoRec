@@ -1316,6 +1316,15 @@ class HyCoRecModel(BaseModel):
 
     # 推荐模块和对话模块分开训练
     def forward(self, batch, mode, stage):
+        idx = batch.get("_sample_idx")
+        if idx is not None:
+            # under DataParallel tensors arrive chunked while list fields are
+            # replicated in full -> keep only this replica's samples
+            idx = idx.tolist()
+            batch = {
+                k: [v[i] for i in idx] if isinstance(v, list) and len(v) > len(idx) else v
+                for k, v in batch.items()
+            }
         if len(self.gpu) >= 2:
             self.edge_idx = self.edge_idx.cuda(torch.cuda.current_device())
             self.edge_type = self.edge_type.cuda(torch.cuda.current_device())

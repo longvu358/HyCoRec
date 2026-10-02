@@ -100,6 +100,11 @@ class HyCoRecSystem(BaseSystem):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device)
+        # DataParallel chunks tensors but replicates python lists; ship the sample
+        # indices as a tensor so each replica can re-align its list fields.
+        n = next((v.size(0) for v in batch.values() if isinstance(v, torch.Tensor)), None)
+        if n is not None:
+            batch['_sample_idx'] = torch.arange(n, device=self.device)
 
         if stage == 'rec':
             rec_loss, rec_scores = self.model.forward(batch, mode, stage)
