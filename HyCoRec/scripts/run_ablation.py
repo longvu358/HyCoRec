@@ -200,7 +200,7 @@ def parse_log(log_path: Path) -> dict:
     return out
 
 
-def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float | None, debug: bool = False, cfg_dir: Path = ABLATION_CFG_DIR, profile: str = "default", stamp: str | None = None) -> dict:
+def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float | None, debug: bool = False, cfg_dir: Path = ABLATION_CFG_DIR, profile: str = "default", stamp: str | None = None, ddp: bool = False) -> dict:
     rid = run_id(cell, seed, profile)
     if debug:
         rid += "_debug"
@@ -215,6 +215,11 @@ def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float 
     t0 = time.time()
     runner = ["uv", "run"] if shutil.which("uv") else [sys.executable]
     cmd = runner + ["run_crslab.py", "-c", str(run_cfg.relative_to(ROOT)), "-g", gpu, "-s", str(seed)]
+    n_gpu = len(gpu.split(","))
+    if ddp and gpu != "-1" and n_gpu > 1:
+        # one process per GPU; --standalone picks a free rendezvous port
+        py = ["uv", "run", "python"] if shutil.which("uv") else [sys.executable]
+        cmd = py + ["-m", "torch.distributed.run", "--standalone", f"--nproc_per_node={n_gpu}"] + cmd[len(runner):]
     if debug:
         cmd.append("-d")
     result = {"cell": cell, "seed": seed, "profile": profile, "stamp": stamp, "config": cfg_file, "run_id": rid, "cmd": " ".join(cmd)}
@@ -304,7 +309,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     for cell, cfg_file, seed in plan:
         if (not args.force) and already_done(results_path, cell, seed, args.gpu_profile):
             continue
-        result = run_one(cell, cfg_file, seed, args.gpu, args.timeout_hours, cfg_dir=cfg_dir, profile=args.gpu_profile, stamp=stamp)
+        result = run_one(cell, cfg_file, seed, args.gpu, args.timeout_hours, cfg_dir=cfg_dir, profile=args.gpu_profile, stamp=stamp, ddp=args.ddp)
         with open(results_path, "a") as f:
             f.write(json.dumps(result) + "\n")
         if result.get("error") and args.stop_on_error:
@@ -455,7 +460,7 @@ def cmd_smoke(args: argparse.Namespace) -> None:
         sys.exit(1)
     result = run_one(
         args.cell, cfg_file, args.seed, args.gpu, args.timeout_hours,
-        debug=True, cfg_dir=GPU_PROFILES[args.gpu_profile], profile=args.gpu_profile,
+        debug=True, cfg_dir=GPU_PROFILES[args.gpu_profile], profile=args.gpu_profile, ddp=args.ddp,
     )
     print(json.dumps(result, indent=2))
 
@@ -468,6 +473,7 @@ def main() -> None:
     p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = every cell in LADDER (all configs; A4/A11 stay blocked)")
     p_run.add_argument("--seeds", nargs="+", type=int, default=[3407], help="spec asks for x3 seeds")
     p_run.add_argument("--gpu", default="0", help="GPU id string for run_crslab.py -g (use -1 for CPU)")
+    p_run.add_argument("--ddp", action="store_true", help="with several --gpu ids, launch via torchrun (one process per GPU, DistributedDataParallel) instead of DataParallel")
     p_run.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES),
                         help="config subdir to run from; 'rtx6000' = same ladder, batch_size x2 for 16GB GPUs")
     p_run.add_argument("--timeout-hours", type=float, default=None, help="kill a single run after N hours")
@@ -484,6 +490,7 @@ def main() -> None:
     p_smoke.add_argument("--cell", default="A0")
     p_smoke.add_argument("--seed", type=int, default=3407)
     p_smoke.add_argument("--gpu", default="0")
+    p_smoke.add_argument("--ddp", action="store_true", help="launch via torchrun, one process per GPU")
     p_smoke.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES))
     p_smoke.add_argument("--timeout-hours", type=float, default=1.0)
     p_smoke.set_defaults(func=cmd_smoke)
