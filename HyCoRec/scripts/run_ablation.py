@@ -8,7 +8,7 @@ scope-fusion weights (alpha_f). Results are appended to a JSONL file (safe to
 resume/rerun) and aggregated into markdown summary tables.
 
 Usage:
-    uv run scripts/run_ablation.py run --seeds 3407                 # 1 seed, full ladder
+    uv run scripts/run_ablation.py run --seeds 3407                 # 1 seed, every cell in LADDER
     uv run scripts/run_ablation.py run --seeds 3407 42 123           # spec-mandated x3
     uv run scripts/run_ablation.py run --cells A0 A1 A2 --seeds 3407 # subset
     uv run scripts/run_ablation.py summarize                        # rebuild tables only
@@ -50,49 +50,43 @@ LOG_DIR = ROOT / "log"
 RESULTS_DIR = ROOT / "results" / "ablation"
 
 # GPU profiles: same cell->filename ladder, resolved under a different config
-# subdir with bigger batch_size for beefier hardware (see --gpu-profile).
+# subdir with a different batch_size per hardware (see --gpu-profile).
 GPU_PROFILES = {
     "default": ABLATION_CFG_DIR,
-    "rtx6000": ABLATION_CFG_DIR / "rtx6000",  # 96GB card: rec/conv batch_size x4
+    "rtx6000": ABLATION_CFG_DIR / "rtx6000",  # 16GB cards (V100/P100): same configs as default, batch_size x2
 }
 
-# Required spec ladder (A4, A11 excluded -- see module docstring).
+# Full ladder: every config under ablation/ (and each GPU profile subdir) runs by default.
+#   A0-A10         spec ladder (A4/A11 excluded -- see BLOCKED)
+#   A3b/A9b1/A10b1 non-spec debug configs
+#   A9_rows7, A9_v22*  ReDial CPC v2.2 variants (need data/collective/hredial_unified_full)
+#   T9, T9_norev       HTGReDial full / review-off control (need data/collective/htgredial_full
+#                      and data/reviews/htgredial/review_index.json for T9)
+# Results of different datasets never mix: summaries are keyed by cell name.
 LADDER = {
     "A0": "A0.yaml",
     "A1": "A1.yaml",
     "A2": "A2.yaml",
     "A3": "A3.yaml",
+    "A3b": "A3b.yaml",
     "A5": "A5.yaml",
     "A6": "A6.yaml",
     "A7": "A7.yaml",
     "A8": "A8.yaml",
     "A9": "A9.yaml",
-    "A10": "A10.yaml",
-}
-BLOCKED = {
-    "A4": "needs the old MHIM retrieval-extension (extension_strategy is dead code)",
-    "A11": "needs HyCoRec's review Transformer P_r (never implemented in this codebase)",
-}
-# Present in config/.../ablation/ but not part of the spec's required table --
-# left available via --include-extra for debugging, excluded from the default run.
-EXTRA = {
-    "A3b": "A3b.yaml",
     "A9b1": "A9b1.yaml",
+    "A10": "A10.yaml",
     "A10b1": "A10b1.yaml",
-}
-
-# Variant / TG cells: not in the default ladder, select with --cells.
-#   A9_rows7, A9_v22*  ReDial CPC v2.2 variants (need data/collective/hredial_unified_full)
-#   T9, T9_norev       HTGReDial full / review-off control (need data/collective/htgredial_full
-#                      and data/reviews/htgredial/review_index.json for T9)
-# Results of different datasets never mix: summaries are keyed by cell name.
-VARIANTS = {
     "A9_rows7": "A9_rows7.yaml",
     "A9_v22": "A9_v22.yaml",
     "A9_v22_noword": "A9_v22_noword.yaml",
     "A9_v22_sep": "A9_v22_sep.yaml",
     "T9": "T9.yaml",
     "T9_norev": "T9_norev.yaml",
+}
+BLOCKED = {
+    "A4": "needs the old MHIM retrieval-extension (extension_strategy is dead code)",
+    "A11": "needs HyCoRec's review Transformer P_r (never implemented in this codebase)",
 }
 
 REC_METRIC_KEYS = [
@@ -115,16 +109,23 @@ def run_id(cell: str, seed: int, profile: str = "default") -> str:
     return f"ablation_{cell}_seed{seed}{suffix}"
 
 
-def build_run_config(cell: str, cfg_file: str, seed: int, log_name: str | None = None, cfg_dir: Path = ABLATION_CFG_DIR) -> Path:
+def new_stamp() -> str:
+    """Timestamp naming one launch of this script: logs go to log/<stamp>/."""
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def build_run_config(cell: str, cfg_file: str, seed: int, log_name: str | None = None, cfg_dir: Path = ABLATION_CFG_DIR, stamp: str | None = None) -> Path:
     """Clone the cell's yaml with a unique log_name/model_file so parallel/serial
-    reruns never clobber each other's logs or checkpoints."""
+    reruns never clobber each other's logs or checkpoints. With ``stamp`` the log
+    goes to log/<stamp>/<rid>.log and the checkpoint to <rid>_<stamp>.pth."""
     src = cfg_dir / cfg_file
     opt = yaml.safe_load(src.read_text())
     rid = log_name or run_id(cell, seed)
-    opt["log_name"] = rid
-    opt["model_file"] = f"{rid}.pth"
-    RUN_CFG_DIR.mkdir(parents=True, exist_ok=True)
-    dst = RUN_CFG_DIR / f"{rid}.yaml"
+    opt["log_name"] = f"{stamp}/{rid}" if stamp else rid
+    opt["model_file"] = f"{rid}_{stamp}.pth" if stamp else f"{rid}.pth"
+    run_cfg_dir = RUN_CFG_DIR / stamp if stamp else RUN_CFG_DIR
+    run_cfg_dir.mkdir(parents=True, exist_ok=True)
+    dst = run_cfg_dir / f"{rid}.yaml"
     dst.write_text(yaml.safe_dump(opt, sort_keys=False))
     return dst
 
@@ -199,14 +200,16 @@ def parse_log(log_path: Path) -> dict:
     return out
 
 
-def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float | None, debug: bool = False, cfg_dir: Path = ABLATION_CFG_DIR, profile: str = "default") -> dict:
+def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float | None, debug: bool = False, cfg_dir: Path = ABLATION_CFG_DIR, profile: str = "default", stamp: str | None = None) -> dict:
     rid = run_id(cell, seed, profile)
     if debug:
         rid += "_debug"
-    run_cfg = build_run_config(cell, cfg_file, seed, log_name=rid, cfg_dir=cfg_dir)
-    stderr_path = LOG_DIR / f"{rid}.stderr"
-    log_path = LOG_DIR / f"{rid}.log"
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = stamp or new_stamp()
+    run_cfg = build_run_config(cell, cfg_file, seed, log_name=rid, cfg_dir=cfg_dir, stamp=stamp)
+    log_dir = LOG_DIR / stamp
+    stderr_path = log_dir / f"{rid}.stderr"
+    log_path = log_dir / f"{rid}.log"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"==> [{rid}] launching (config={run_cfg.relative_to(ROOT)}, gpu={gpu}, debug={debug})", flush=True)
     t0 = time.time()
@@ -214,7 +217,7 @@ def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float 
     cmd = runner + ["run_crslab.py", "-c", str(run_cfg.relative_to(ROOT)), "-g", gpu, "-s", str(seed)]
     if debug:
         cmd.append("-d")
-    result = {"cell": cell, "seed": seed, "profile": profile, "config": cfg_file, "run_id": rid, "cmd": " ".join(cmd)}
+    result = {"cell": cell, "seed": seed, "profile": profile, "stamp": stamp, "config": cfg_file, "run_id": rid, "cmd": " ".join(cmd)}
     try:
         with open(stderr_path, "w") as errf:
             # own process group: on timeout kill the whole tree, not just the
@@ -272,16 +275,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     for name in args.cells or list(LADDER):
         if name in LADDER:
             cells[name] = LADDER[name]
-        elif name in EXTRA:
-            cells[name] = EXTRA[name]
-        elif name in VARIANTS:
-            cells[name] = VARIANTS[name]
         elif name in BLOCKED:
             print(f"!! skipping {name}: BLOCKED ({BLOCKED[name]})")
         else:
             print(f"!! unknown cell {name!r}, skipping")
-    if args.include_extra:
-        cells.update(EXTRA)
 
     if args.gpu_profile not in GPU_PROFILES:
         print(f"!! unknown --gpu-profile {args.gpu_profile!r}, choices: {list(GPU_PROFILES)}")
@@ -295,6 +292,8 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     results_path = RESULTS_DIR / "results.jsonl"
+    stamp = new_stamp()
+    print(f"Logs: log/{stamp}/")
 
     plan = [(c, f, s) for c, f in cells.items() for s in args.seeds]
     print(f"Ablation plan: {len(plan)} runs ({len(cells)} cells x {len(args.seeds)} seeds, gpu-profile={args.gpu_profile})")
@@ -305,7 +304,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     for cell, cfg_file, seed in plan:
         if (not args.force) and already_done(results_path, cell, seed, args.gpu_profile):
             continue
-        result = run_one(cell, cfg_file, seed, args.gpu, args.timeout_hours, cfg_dir=cfg_dir, profile=args.gpu_profile)
+        result = run_one(cell, cfg_file, seed, args.gpu, args.timeout_hours, cfg_dir=cfg_dir, profile=args.gpu_profile, stamp=stamp)
         with open(results_path, "a") as f:
             f.write(json.dumps(result) + "\n")
         if result.get("error") and args.stop_on_error:
@@ -345,7 +344,7 @@ def build_summary(results_path: Path, profile_filter: str | None = None) -> None
             continue
         by_cell.setdefault(label(r), []).append(r)
 
-    order = list(LADDER) + list(EXTRA) + list(VARIANTS)
+    order = list(LADDER)
     cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
 
     rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
@@ -410,7 +409,7 @@ def build_val_summary(results_path: Path, profile_filter: str | None = None) -> 
         r = {**r, "rec_valid": reparsed["rec_valid"], "conv_valid": reparsed["conv_valid"]}
         by_cell.setdefault(label(r), []).append(r)
 
-    order = list(LADDER) + list(EXTRA) + list(VARIANTS)
+    order = list(LADDER)
     cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
 
     rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
@@ -447,7 +446,7 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 def cmd_smoke(args: argparse.Namespace) -> None:
     """Fast harness check: trains on the (small) valid split via run_crslab.py -d.
     Does NOT write to results.jsonl / summary.md -- just proves the plumbing works."""
-    cfg_file = LADDER.get(args.cell) or EXTRA.get(args.cell) or VARIANTS.get(args.cell)
+    cfg_file = LADDER.get(args.cell)
     if not cfg_file:
         print(f"unknown cell {args.cell!r}")
         sys.exit(1)
@@ -466,12 +465,11 @@ def main() -> None:
     sub = p.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="run (missing) ablation cells and rebuild the summary")
-    p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = full spec ladder minus A4/A11; also A9_rows7/A9_v22*/T9/T9_norev")
-    p_run.add_argument("--include-extra", action="store_true", help="also run the non-spec debug configs (A3b, A9b1, A10b1)")
+    p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = every cell in LADDER (all configs; A4/A11 stay blocked)")
     p_run.add_argument("--seeds", nargs="+", type=int, default=[3407], help="spec asks for x3 seeds")
     p_run.add_argument("--gpu", default="0", help="GPU id string for run_crslab.py -g (use -1 for CPU)")
     p_run.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES),
-                        help="config subdir to run from; 'rtx6000' = same ladder, batch_size x4 for a 96GB GPU")
+                        help="config subdir to run from; 'rtx6000' = same ladder, batch_size x2 for 16GB GPUs")
     p_run.add_argument("--timeout-hours", type=float, default=None, help="kill a single run after N hours")
     p_run.add_argument("--force", action="store_true", help="rerun cells/seeds that already have a successful result")
     p_run.add_argument("--stop-on-error", action="store_true")
