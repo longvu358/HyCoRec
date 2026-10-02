@@ -1326,8 +1326,14 @@ class HyCoRecModel(BaseModel):
                 for k, v in batch.items()
             }
         if len(self.gpu) >= 2:
-            self.edge_idx = self.edge_idx.cuda(torch.cuda.current_device())
-            self.edge_type = self.edge_type.cuda(torch.cuda.current_device())
+            # DataParallel replica: self.device was fixed to cuda:0 at init, but
+            # every `device=self.device` below must follow this replica's GPU.
+            # (replicas are shallow module copies, so this is per-replica.)
+            self.device = torch.device("cuda", torch.cuda.current_device())
+            self.edge_idx = self.edge_idx.to(self.device)
+            self.edge_type = self.edge_type.to(self.device)
+            if torch.is_tensor(getattr(self, "hredial_copy_mask", None)):
+                self.hredial_copy_mask = self.hredial_copy_mask.to(self.device)
         if stage == "conv":
             return self.converse(batch, mode)
         if stage == "rec":
