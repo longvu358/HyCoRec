@@ -14,7 +14,10 @@ import torch
 from loguru import logger
 from torch.utils.data import DataLoader as TorchDataLoader
 from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
+
+from crslab import distributed
 
 
 class _SequenceDataset(TorchDataset):
@@ -78,6 +81,7 @@ class BaseDataLoader(ABC):
         # configured, its worker pool (persistent_workers=True) survives
         # across epochs instead of being spawned/torn down every time.
         self._loader_cache = {}
+        self._epoch_count = {}
 
     def _get_processed_dataset(self, process_fn):
         dataset = self.dataset if process_fn is None else None
@@ -107,10 +111,18 @@ class BaseDataLoader(ABC):
         loader_key = (getattr(batch_fn, "__func__", batch_fn), batch_size, shuffle)
         loader = self._loader_cache.get(loader_key)
         if loader is None:
+            # DDP: shard only the shuffled (= training) loaders across ranks; eval
+            # loaders (shuffle=False) are consumed whole by rank 0 alone.
+            sampler = None
+            if distributed.is_ddp() and shuffle:
+                sampler = DistributedSampler(
+                    _SequenceDataset(dataset), num_replicas=distributed.world_size(),
+                    rank=distributed.rank(), shuffle=True)
             loader = TorchDataLoader(
                 _SequenceDataset(dataset),
                 batch_size=batch_size,
-                shuffle=shuffle,
+                sampler=sampler,
+                shuffle=shuffle and sampler is None,
                 collate_fn=batch_fn,
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
@@ -118,7 +130,12 @@ class BaseDataLoader(ABC):
             )
             self._loader_cache[loader_key] = loader
 
-        for batch in tqdm(loader, total=len(loader)):
+        if isinstance(loader.sampler, DistributedSampler):
+            epoch = self._epoch_count.get(loader_key, 0)
+            loader.sampler.set_epoch(epoch)
+            self._epoch_count[loader_key] = epoch + 1
+
+        for batch in tqdm(loader, total=len(loader), disable=not distributed.is_main()):
             if batch is False:
                 continue
             else:

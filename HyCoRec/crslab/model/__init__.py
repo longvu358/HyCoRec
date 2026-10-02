@@ -27,6 +27,12 @@ def get_model(config, model_name, device, vocab, side_data=None):
         logger.info(f'[Build model {model_name}]')
         if config.opt["gpu"] == [-1]:
             return model
+        elif config.opt.get("ddp"):
+            model = model.to(device)
+            # find_unused_parameters: rec/conv stages each leave the other's params unused
+            return torch.nn.parallel.DistributedDataParallel(
+                model, device_ids=[device.index], find_unused_parameters=True,
+                broadcast_buffers=False)
         else:
             return torch.nn.DataParallel(model, device_ids=config["gpu"])
 

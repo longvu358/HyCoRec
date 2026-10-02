@@ -307,6 +307,7 @@ class HyCoRecModel(BaseModel):
         """
         self.device = device
         self.gpu = opt.get("gpu", -1)
+        self.ddp = bool(opt.get("ddp", False))
         self.dataset = opt.get("dataset", None)
         self.llm = opt.get("llm", "chatgpt-4o")
         assert self.dataset in [
@@ -432,7 +433,7 @@ class HyCoRecModel(BaseModel):
                 "pretrain", self.dataset, str(self.pretrain_epoch) + "-epoch.pth"
             )
             self.pretrain_data = torch.load(
-                pretrain_file, map_location=torch.device("cuda:" + str(self.gpu[0]))
+                pretrain_file, map_location=self.device
             )
             logger.info(f"[Load Pretrain Weights from {pretrain_file}]")
         if self.dataset == "HReDial":
@@ -1325,7 +1326,7 @@ class HyCoRecModel(BaseModel):
                 k: [v[i] for i in idx] if isinstance(v, list) and len(v) > len(idx) else v
                 for k, v in batch.items()
             }
-        if len(self.gpu) >= 2:
+        if len(self.gpu) >= 2 and not self.ddp:
             # DataParallel replica: self.device was fixed to cuda:0 at init, but
             # every `device=self.device` below must follow this replica's GPU.
             # (replicas are shallow module copies, so this is per-replica.)

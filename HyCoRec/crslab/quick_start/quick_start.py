@@ -8,6 +8,7 @@
 # @Author  :   Xiaolei Wang
 # @email   :   wxl1999@foxmail.com
 
+from crslab import distributed
 from crslab.config import Config
 from crslab.data import get_dataset, get_dataloader
 from crslab.system import get_system
@@ -32,7 +33,34 @@ def run_crslab(config, save_data=False, restore_data=False, save_system=False, r
        https://github.com/RUCAIBox/CRSLab
 
     """
-    # dataset & dataloader
+    # dataset & dataloader. DDP: rank 0 builds/saves the processed dataset, the
+    # other ranks wait and restore it (avoids every rank writing the same cache).
+    if distributed.is_ddp() and save_data and not restore_data:
+        if distributed.is_main():
+            out = _build_data(config, restore_data, save_data)
+            distributed.barrier()
+        else:
+            distributed.barrier()
+            out = _build_data(config, True, False)
+    else:
+        out = _build_data(config, restore_data, save_data)
+    train_dataloader, valid_dataloader, test_dataloader, vocab, side_data = out
+
+    # system
+    CRS = get_system(config, train_dataloader, valid_dataloader, test_dataloader, vocab, side_data, restore_system,
+                     interact, debug)
+    if interact:
+        CRS.interact()
+    else:
+        CRS.fit()
+        if save_system:
+            CRS.save_model()
+    distributed.cleanup()
+
+    return
+
+
+def _build_data(config, restore_data, save_data):
     if isinstance(config['tokenize'], str):
         CRS_dataset = get_dataset(config, config['tokenize'], restore_data, save_data)
         side_data = CRS_dataset.side_data
@@ -69,14 +97,4 @@ def run_crslab(config, save_data=False, restore_data=False, save_system=False, r
             valid_dataloader[task] = get_dataloader(config, valid_data, valid_review, vocab[task], review_id2entity)
             test_dataloader[task] = get_dataloader(config, test_data, test_review, vocab[task], review_id2entity)
 
-    # system
-    CRS = get_system(config, train_dataloader, valid_dataloader, test_dataloader, vocab, side_data, restore_system,
-                     interact, debug)
-    if interact:
-        CRS.interact()
-    else:
-        CRS.fit()
-        if save_system:
-            CRS.save_model()
-
-    return
+    return train_dataloader, valid_dataloader, test_dataloader, vocab, side_data

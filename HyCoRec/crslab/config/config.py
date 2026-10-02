@@ -19,6 +19,8 @@ import random
 import numpy as np
 import torch
 
+from crslab import distributed
+
 
 class Config:
     """Configurator module that load the defined parameters."""
@@ -48,6 +50,9 @@ class Config:
         # gpu
         os.environ['CUDA_VISIBLE_DEVICES'] = gpu
         self.opt['gpu'] = [i for i in range(len(gpu.split(',')))] if gpu != '-1' else [-1]
+        # DDP (torchrun): one process per GPU, rank/local_rank come from the launcher env
+        distributed.setup()
+        self.opt['ddp'] = distributed.is_ddp()
         # dataset
         dataset = self.opt['dataset']
         tokenize = self.opt['tokenize']
@@ -81,8 +86,12 @@ class Config:
             level = 'DEBUG'
         else:
             level = 'INFO'
-        logger.add(os.path.join("log", log_name), level=level)
-        logger.add(lambda msg: tqdm.write(msg, end=''), colorize=True, level=level)
+        if distributed.is_main():
+            logger.add(os.path.join("log", log_name), level=level)
+            logger.add(lambda msg: tqdm.write(msg, end=''), colorize=True, level=level)
+        else:
+            # DDP worker: only surface problems, rank 0 owns the log file
+            logger.add(lambda msg: tqdm.write(msg, end=''), colorize=True, level='WARNING')
 
         logger.info(f"[Dataset: {dataset} tokenized in {tokenize}]")
         if model:

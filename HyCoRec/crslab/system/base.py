@@ -21,6 +21,7 @@ from loguru import logger
 from torch import optim
 from transformers import Adafactor
 
+from crslab import distributed
 from crslab.config import SAVE_PATH
 from crslab.evaluator import get_evaluator
 from crslab.evaluator.metrics.base import AverageMetric
@@ -58,8 +59,11 @@ class BaseSystem(ABC):
         if opt["gpu"] == [-1]:
             self.device = torch.device('cpu')
         else:
-            # multi-GPU: DataParallel requires the master copy on device_ids[0]
-            self.device = torch.device('cuda:0')
+            # multi-GPU: DataParallel requires the master copy on device_ids[0];
+            # DDP: each process owns the GPU matching its local rank
+            self.device = torch.device('cuda', distributed.local_rank() if opt.get('ddp') else 0)
+        self.ddp = bool(opt.get('ddp'))
+        self.is_main = distributed.is_main()
         # seed
         if 'seed' in opt:
             seed = int(opt['seed'])
@@ -100,6 +104,8 @@ class BaseSystem(ABC):
 
         if not interact:
             self.evaluator = get_evaluator('standard', opt['dataset'], opt['rankfile'])
+            if not self.is_main:
+                self.evaluator.file_path = None  # only rank 0 writes the result json
 
     def init_optim(self, opt, parameters):
         self.optim_opt = opt
@@ -256,6 +262,8 @@ class BaseSystem(ABC):
 
     def save_model(self):
         r"""Store the model parameters."""
+        if not self.is_main:
+            return
         state = {}
         if hasattr(self, 'model'):
             state['model_state_dict'] = self.model.state_dict()

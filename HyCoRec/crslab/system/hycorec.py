@@ -10,6 +10,7 @@ import torch
 import pickle as pkl
 from loguru import logger
 
+from crslab import distributed
 from crslab.config import DATA_PATH
 from crslab.evaluator.metrics.base import AverageMetric
 from crslab.evaluator.metrics.gen import PPLMetric
@@ -50,6 +51,11 @@ class HyCoRecSystem(BaseSystem):
         self.conv_epoch = self.conv_optim_opt['epoch']
         self.rec_batch_size = self.rec_optim_opt['batch_size']
         self.conv_batch_size = self.conv_optim_opt['batch_size']
+        # DDP: the configured batch size is the *global* one (same as DataParallel
+        # splitting it); each rank trains on its share. Rank-0 eval uses the full size.
+        ws = distributed.world_size()
+        self.rec_train_bs = max(1, self.rec_batch_size // ws)
+        self.conv_train_bs = max(1, self.conv_batch_size // ws)
 
     @staticmethod
     def _load_tail_items(opt):
@@ -106,8 +112,12 @@ class HyCoRecSystem(BaseSystem):
         if n is not None:
             batch['_sample_idx'] = torch.arange(n, device=self.device)
 
+        # DDP forward is a collective (grad sync / buffer bcast); eval runs on rank 0
+        # only, so it must bypass the wrapper.
+        model = self.model.module if self.ddp and mode != 'train' else self.model
+
         if stage == 'rec':
-            rec_loss, rec_scores = self.model.forward(batch, mode, stage)
+            rec_loss, rec_scores = model.forward(batch, mode, stage)
             rec_loss = rec_loss.sum()
             if mode == 'train':
                 self.backward(rec_loss)
@@ -117,7 +127,7 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss))
         else:
             if mode != 'test':
-                gen_loss, preds = self.model.forward(batch, mode, stage)
+                gen_loss, preds = model.forward(batch, mode, stage)
                 if mode == 'train':
                     self.backward(gen_loss)
                 else:
@@ -126,7 +136,7 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.optim_metrics.add('gen_loss', AverageMetric(gen_loss))
                 self.evaluator.gen_metrics.add("ppl", PPLMetric(gen_loss))
             else:
-                preds = self.model.forward(batch, mode, stage)
+                preds = model.forward(batch, mode, stage)
                 self.conv_evaluate(preds, batch['response'], batch.get('user_id', None), batch['conv_id'])
 
     def train_recommender(self):
@@ -136,30 +146,35 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             logger.info(f'[Recommendation epoch {str(epoch)}]')
             logger.info('[Train]')
-            for batch in self.train_dataloader.get_rec_data(self.rec_batch_size):
+            for batch in self.train_dataloader.get_rec_data(self.rec_train_bs):
                 self.step(batch, stage='rec', mode='train')
             self.evaluator.report(epoch=epoch, mode='train')
-            # val
+            # val (rank 0 only; its metric drives lr/early-stop on every rank)
             logger.info('[Valid]')
-            with torch.no_grad():
-                self.evaluator.reset_metrics()
-                for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                    self.step(batch, stage='rec', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
-                # early stop
-                metric = self.evaluator.rec_metrics['recall@50']
-                self.adjust_lr(metric)
-                if self.early_stop(metric):
-                    break
+            metric = None
+            if self.is_main:
+                with torch.no_grad():
+                    self.evaluator.reset_metrics()
+                    for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
+                        self.step(batch, stage='rec', mode='valid')
+                    self.evaluator.report(epoch=epoch, mode='valid')
+                    metric = self.evaluator.rec_metrics['recall@50']
+            metric = distributed.broadcast(metric)
+            self.adjust_lr(metric)
+            if self.early_stop(metric):
+                break
         if self.need_early_stop:
+            distributed.barrier()  # rank 0 must have finished writing the checkpoint
             self.restore_model()
         # test
         logger.info('[Test]')
-        with torch.no_grad():
-            self.evaluator.reset_metrics()
-            for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
-                self.step(batch, stage='rec', mode='test')
-            self.evaluator.report(mode='test')
+        if self.is_main:
+            with torch.no_grad():
+                self.evaluator.reset_metrics()
+                for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
+                    self.step(batch, stage='rec', mode='test')
+                self.evaluator.report(mode='test')
+        distributed.barrier()
         fusion = getattr(self.model, 'module', self.model).fusion
         logger.info(f'[Scope fusion weights alpha_f] {fusion.weight_table()}')
 
@@ -174,28 +189,32 @@ class HyCoRecSystem(BaseSystem):
             self.evaluator.reset_metrics()
             logger.info(f'[Conversation epoch {str(epoch)}]')
             logger.info('[Train]')
-            for batch in self.train_dataloader.get_conv_data(batch_size=self.conv_batch_size):
+            for batch in self.train_dataloader.get_conv_data(batch_size=self.conv_train_bs):
                 self.step(batch, stage='conv', mode='train')
             self.evaluator.report(epoch=epoch, mode='train')
-            # val
+            # val (rank 0 only; its metric drives lr/early-stop on every rank)
             logger.info('[Valid]')
-            with torch.no_grad():
-                self.evaluator.reset_metrics()
-                for batch in self.valid_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
-                    self.step(batch, stage='conv', mode='valid')
-                self.evaluator.report(epoch=epoch, mode='valid')
-                # early stop
-                metric = self.evaluator.optim_metrics['gen_loss']
-                self.adjust_lr(metric)
-                if self.early_stop(metric):
-                    break
+            metric = None
+            if self.is_main:
+                with torch.no_grad():
+                    self.evaluator.reset_metrics()
+                    for batch in self.valid_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
+                        self.step(batch, stage='conv', mode='valid')
+                    self.evaluator.report(epoch=epoch, mode='valid')
+                    metric = self.evaluator.optim_metrics['gen_loss']
+            metric = distributed.broadcast(metric)
+            self.adjust_lr(metric)
+            if self.early_stop(metric):
+                break
         # test
         logger.info('[Test]')
-        with torch.no_grad():
-            self.evaluator.reset_metrics()
-            for batch in self.test_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
-                self.step(batch, stage='conv', mode='test')
-            self.evaluator.report(mode='test')
+        if self.is_main:
+            with torch.no_grad():
+                self.evaluator.reset_metrics()
+                for batch in self.test_dataloader.get_conv_data(batch_size=self.conv_batch_size, shuffle=False):
+                    self.step(batch, stage='conv', mode='test')
+                self.evaluator.report(mode='test')
+        distributed.barrier()
 
     def fit(self):
         self.train_recommender()
