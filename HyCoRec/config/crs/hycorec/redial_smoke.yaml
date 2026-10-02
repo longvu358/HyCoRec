@@ -46,6 +46,7 @@ k_hist: 40
 k_hop: 1
 context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
 hconv_layers: 2
+scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse
 alpha_init: [-1, 0, -1]
 ei_mode: xg              # base | xg
 freeze_alpha: false

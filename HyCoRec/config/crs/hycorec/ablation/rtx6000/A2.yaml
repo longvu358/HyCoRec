@@ -34,13 +34,14 @@ k_hist: 40
 k_hop: 1
 context_window_w: 1
 hconv_layers: 2
+scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse
 alpha_init: [-1, 0, -1]
 ei_mode: base
 freeze_alpha: false
 collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
-  epoch: 2
+  epoch: 10
   batch_size: 256
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
@@ -54,7 +55,7 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 1
+  epoch: 5
   batch_size: 512
   impatience: 1
   optimizer:
