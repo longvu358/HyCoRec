@@ -382,6 +382,11 @@ class HyCoRecModel(BaseModel):
         self.scopes = [s.upper() for s in opt.get("scopes", ["C", "P", "G"])]
         self.k_hist = opt.get("k_hist", 40)
         self.k_hop = opt.get("k_hop", 1)  # k-hop for H^P_{E,W}; 1 == HyCoRec baseline
+        # cap on neighbors/hop for the H^P_{E,W} k-hop expansion (None = uncapped,
+        # matches original behaviour). Guards against hub nodes in entity_adj/
+        # word_adj blowing a single sample's P-scope hyperedge up to thousands
+        # of nodes -- see khop_closure's docstring in cpc.py.
+        self.khop_cap = opt.get("khop_cap", None)
         # sliding-window size w for scope C (spec v2.1 Eq. 2): one hyperedge per
         # turn position t'<=t, merging the w turns ending at t'. w=1 degenerates
         # to per-turn co-mention hyperedges (the v2.1 ablation floor for C, A2).
@@ -389,12 +394,24 @@ class HyCoRecModel(BaseModel):
             opt.get("context_window_w", opt.get("hyperedge_window_k", None)) or 3
         )
         self.hconv_layers = opt.get("hconv_layers", 2)
+        # scope_weights: "shared" = one HConv stack per field reused by C, P and G
+        # (spec 3.1, checkpoint-compatible); "separate" = each scope owns its own
+        # stack (C: self.hconv, P: self.hconv_p, G: self.hconv_g).
+        self.scope_weights = opt.get("scope_weights", "shared")
+        assert self.scope_weights in ("shared", "separate")
         self.collective_path = opt.get("collective_path", None)
         self.alpha_init = tuple(opt.get("alpha_init", (-1.0, 0.0, -1.0)))
         self.freeze_alpha = opt.get("freeze_alpha", False)
+        # fusion_mode: "field" = v2.1 per-field softmax alpha over (C,P,G) then
+        # attention on 3 rows; "rows7" = v2.2 Eq. 11-13 (MHA(P_c, R, R) over the
+        # up-to-7 pooled scope rows, empty rows dropped from the key set).
+        self.fusion_mode = opt.get("fusion_mode", "field")
+        self.word_rgcn = opt.get("word_rgcn", True)
+        assert self.fusion_mode in ("field", "rows7")
         self.ei_mode = opt.get("ei_mode", "xg")  # base | xg  (Eq. 14a / 14b)
         self.item_entity_ids = list(side_data.get("item_entity_ids", []))
         self.collective = None
+        self.g_unified = False
         # Branch 2: review-hypergraph in scope P, field E (Eq. 1r/1s). Scope G's
         # review + aspect hyperedges (Eq. 4/6, 5/7) are baked into Â^G_{E,I}
         # offline by build_collective.py --use_review; nothing to load here for G.
@@ -468,8 +485,26 @@ class HyCoRecModel(BaseModel):
             )
             self.scopes = [s for s in self.scopes if s != "G"]
             return
-        self.collective = load_collective(path).to(self.device)
-        logger.info(f"[CPC] loaded collective propagation matrices from {path}")
+        # v2.2: a single unified Â^G over V^G = V_E u V_W (A_hat_G.npz)
+        self.g_unified = os.path.isfile(os.path.join(path, "A_hat_G.npz"))
+        if self.g_unified:
+            assert (
+                self.fusion_mode == "rows7"
+            ), "unified Â^G (A_hat_G.npz) needs fusion_mode: rows7"
+            self.collective = load_collective(path, fields=("G",)).to(self.device)
+        else:
+            self.collective = load_collective(path).to(self.device)
+        if self.scope_weights == "separate":
+            keys = ("G",) if self.g_unified else ("item", "entity", "word")
+            for k in keys:
+                self.hconv_g[k] = nn.ModuleList(
+                    CustomHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+                    for _ in range(self.hconv_layers)
+                )
+        logger.info(
+            f"[CPC] loaded collective propagation matrices from {path} "
+            f"(unified={self.g_unified})"
+        )
 
     # 构建 mask
     def _build_hredial_copy_mask(self):
@@ -642,19 +677,25 @@ class HyCoRecModel(BaseModel):
         )
         if self.pretrain:
             self.item_encoder.load_state_dict(self.pretrain_data["encoder"])
-        # hypergraph convolution: ONE stack of L layers per field, SHARED across
-        # the three scopes C/P/G (spec 3.1 -- C and P are small and would overfit
-        # with private weights; all scopes must live in one space so the linear
-        # fusion in Eq. 12 is meaningful).
-        self.hconv = nn.ModuleDict(
-            {
-                field: nn.ModuleList(
-                    CustomHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
-                    for _ in range(self.hconv_layers)
-                )
-                for field in ("item", "entity", "word")
-            }
-        )
+        # hypergraph convolution. scope_weights="shared": ONE stack of L layers
+        # per field reused by C/P/G (spec 3.1). "separate": every hypergraph owns
+        # its stack -- C and P one per field (3 + 3), G one (unified) -- so
+        # 7 stacks in the v2.2 layout, one per row of R.
+        def _stack():
+            return nn.ModuleList(
+                CustomHypergraphConv(self.kg_emb_dim, self.kg_emb_dim)
+                for _ in range(self.hconv_layers)
+            )
+
+        self.hconv = nn.ModuleDict({f: _stack() for f in ("item", "entity", "word")})
+        if self.scope_weights == "separate":
+            self.hconv_p = nn.ModuleDict(
+                {f: _stack() for f in ("item", "entity", "word")}
+            )
+            # G's stacks are created in _load_collective, once it is known whether
+            # Â^G is unified (one stack "G") or per-field (one stack per field).
+            self.hconv_g = nn.ModuleDict()
+
         # learned per-field softmax fusion of the C/P/G pooled vectors (Eq. 11-12)
         self.fusion = ScopeFusion(init=self.alpha_init, freeze=self.freeze_alpha)
         # attention type
@@ -775,7 +816,12 @@ class HyCoRecModel(BaseModel):
             "word": self.word_adj,
         }[field]
 
-    def _scope_hconv(self, hyperedges, field, tot_embedding, exclude=None):
+    def _stack_for(self, scope, field):
+        if self.scope_weights == "shared" or scope == "C":
+            return self.hconv[field]
+        return (self.hconv_p if scope == "P" else self.hconv_g)[field]
+
+    def _scope_hconv(self, scope, hyperedges, field, tot_embedding, exclude=None):
         """Shared L-layer conv over a locally built incidence.
         Returns (x_sub: (n_sub, d), tot2sub: dict) or (None, {})."""
         uniq, coo, n_edges = build_incidence(hyperedges, exclude=exclude)
@@ -788,23 +834,28 @@ class HyCoRecModel(BaseModel):
             dtype=torch.long,
             device=self.device,
         )
-        for layer in self.hconv[field]:
+        for layer in self._stack_for(scope, field):
             x = layer(x, ei, num_edges=n_edges)
         return x, tot2sub
 
-    def _pool_local(self, x, tot2sub, query_nodes):
+    def _empty_row(self, none_if_empty):
+        return None if none_if_empty else torch.zeros(self.kg_emb_dim, device=self.device)
+
+    def _pool_local(self, x, tot2sub, query_nodes, none_if_empty=False):
         if x is None:
-            return torch.zeros(self.kg_emb_dim, device=self.device)
+            return self._empty_row(none_if_empty)
         rows = [tot2sub[v] for v in dict.fromkeys(query_nodes) if v in tot2sub]
         if not rows:
-            return torch.zeros(self.kg_emb_dim, device=self.device)
+            return self._empty_row(none_if_empty)
         return x[rows].mean(dim=0)
 
-    def _pool_dense(self, xg, query_nodes):
+    def _gather_dense(self, xg, query_nodes):
         rows = sorted({v for v in query_nodes if 0 <= v < xg.size(0)})
-        if not rows:
-            return torch.zeros(self.kg_emb_dim, device=self.device)
-        return xg[rows].mean(dim=0)
+        return xg[rows] if rows else None
+
+    def _pool_dense(self, xg, query_nodes, none_if_empty=False):
+        g = self._gather_dense(xg, query_nodes)
+        return self._empty_row(none_if_empty) if g is None else g.mean(dim=0)
 
     def _personal_hyperedges(self, field, hist_field_sessions, item_sessions=None):
         """H^P_f node sets + the readout node set Q^P_f.
@@ -825,7 +876,10 @@ class HyCoRecModel(BaseModel):
             return edges, q
         seeds = sorted({v for s in hist_field_sessions for v in s})
         adj = self._field_adj(field)
-        edges = [sorted(khop_closure([v], adj, self.k_hop)) for v in seeds]
+        edges = [
+            sorted(khop_closure([v], adj, self.k_hop, max_neighbors=self.khop_cap))
+            for v in seeds
+        ]
         if field == "entity" and self.use_review_hypergraph and self.review_index and item_sessions:
             i_p = sorted({v for s in item_sessions for v in s})
             edges += [
@@ -837,16 +891,20 @@ class HyCoRecModel(BaseModel):
         return edges, q
 
     def _cpc_field_preferences(self, batch, field_x0, xg_by_field):
-        """Per sample -> (P_I, P_E, P_W) fused vectors + context embedding.
+        """Per sample -> (fused rows, context embedding).
 
-        Returns (list[Tensor (3, d)], list[Tensor (n_ctx, d) or None]).
+        ``fusion_mode == "field"``: rows is (3, d) = fused (P_I, P_E, P_W).
+        ``fusion_mode == "rows7"``: rows is (n_rows<=7, d) = non-empty pooled
+        rows [r^C_I,r^C_E,r^C_W, r^P_I,r^P_E,r^P_W, r^G] (spec v2.2 Eq. 11).
         """
+        rows7 = self.fusion_mode == "rows7"
         bsz = len(batch["conv_id"])
         fused_all, ctx_all = [], []
         for b in range(bsz):
             target = int(batch["item"][b]) if "item" in batch else None
             has_history = bool(batch["has_history"][b])
             per_field = []
+            c_rows, p_rows, g_parts, g_ids = [], [], [], []
             for field in self._FIELDS:
                 x0 = field_x0[field]
                 readout = batch[f"readout_{field}"][b]
@@ -856,10 +914,10 @@ class HyCoRecModel(BaseModel):
                     ctx_edges = sliding_window_hyperedges(
                         batch[f"context_turn_{field}"][b], self.context_window_w
                     )
-                    xc, mc = self._scope_hconv(ctx_edges, field, x0, exclude=target)
-                    p_c = self._pool_local(xc, mc, readout)
+                    xc, mc = self._scope_hconv("C", ctx_edges, field, x0, exclude=target)
+                    p_c = self._pool_local(xc, mc, readout, none_if_empty=rows7)
                 else:
-                    p_c = torch.zeros(self.kg_emb_dim, device=self.device)
+                    p_c = self._empty_row(rows7)
 
                 # scope P
                 p_used_history = has_history and "P" in self.scopes
@@ -869,22 +927,52 @@ class HyCoRecModel(BaseModel):
                         batch[f"history_session_{field}"][b],
                         item_sessions=batch["history_session_item"][b],
                     )
-                    xp, mp = self._scope_hconv(p_edges, field, x0, exclude=target)
-                    p_p = self._pool_local(xp, mp, q_p)
+                    xp, mp = self._scope_hconv("P", p_edges, field, x0, exclude=target)
+                    p_p = self._pool_local(xp, mp, q_p, none_if_empty=rows7)
                 else:
-                    p_p, q_p = p_c, []
+                    p_p, q_p = (None if rows7 else p_c), []
 
                 # scope G
-                if "G" in self.scopes and xg_by_field is not None:
+                if "G" in self.scopes and xg_by_field is not None and self.g_unified:
+                    off = field_x0["entity"].size(0) if field == "word" else 0
+                    g_ids.extend(v + off for v in list(readout) + list(q_p))
+                    p_g = None
+                elif "G" in self.scopes and xg_by_field is not None:
                     q_g = list(readout) + list(q_p)
-                    p_g = self._pool_dense(xg_by_field[field], q_g)
+                    if rows7:
+                        g = self._gather_dense(xg_by_field[field], q_g)
+                        if g is not None:
+                            g_parts.append(g)
+                        p_g = None
+                    else:
+                        p_g = self._pool_dense(xg_by_field[field], q_g)
                 else:
-                    p_g = torch.zeros(self.kg_emb_dim, device=self.device)
+                    p_g = self._empty_row(rows7)
 
-                per_field.append(
-                    self.fusion.fuse(field, p_c, p_p, p_g, has_history=p_used_history)
+                if rows7:
+                    c_rows.append(p_c)
+                    p_rows.append(p_p)
+                else:
+                    per_field.append(
+                        self.fusion.fuse(field, p_c, p_p, p_g, has_history=p_used_history)
+                    )
+            if rows7:
+                # r^G: unified Â^G (Eq. 9-10) if loaded, else the interim mean
+                # over Q^G gathered across the three per-field Â^G_f.
+                if self.g_unified and xg_by_field is not None:
+                    # Eq. 9-10: Q^G over the unified index space, one mean
+                    g = self._gather_dense(xg_by_field["G"], g_ids)
+                    r_g = None if g is None else g.mean(0)
+                else:
+                    r_g = torch.cat(g_parts, 0).mean(0) if g_parts else None
+                rows = [r for r in c_rows + p_rows + [r_g] if r is not None]
+                fused_all.append(
+                    torch.stack(rows, 0)
+                    if rows
+                    else torch.zeros(0, self.kg_emb_dim, device=self.device)
                 )
-            fused_all.append(torch.stack(per_field, dim=0))
+            else:
+                fused_all.append(torch.stack(per_field, dim=0))
             ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
             ctx_all.append(field_x0["entity"][ctx_ids] if ctx_ids else None)
         return fused_all, ctx_all
@@ -899,8 +987,15 @@ class HyCoRecModel(BaseModel):
     def _collective_by_field(self, field_x0):
         if "G" not in self.scopes or self.collective is None:
             return None
+        if self.g_unified:
+            # Eq. 8G: one conv over V^G. shared: W_G := W_E (tied to the
+            # entity-field HConv layers); separate: G's own stack. Word ids sit at offset n_entity.
+            x0 = torch.cat([field_x0["entity"], field_x0["word"]], dim=0)
+            stack = self._stack_for("G", "G" if self.scope_weights == "separate" else "entity")
+            return {"G": self.collective.run("G", x0, stack)}
         return {
-            f: self.collective.run(f, field_x0[f], self.hconv[f]) for f in self._FIELDS
+            f: self.collective.run(f, field_x0[f], self._stack_for("G", f))
+            for f in self._FIELDS
         }
 
     def _get_hllm_embedding(self, tot_embedding, hllm_hyper_graph, adj, conv):
@@ -939,6 +1034,15 @@ class HyCoRecModel(BaseModel):
             res_data.append(temp_hyper_grapth)
         return res_data
 
+    def _user_from_rows(self, rows, ctx):
+        """Spec v2.2 3.4 cold-start handling around Eq. 12-13. In ``field`` mode
+        ``rows`` is never empty so this reduces to ``_attention_and_gating``."""
+        if rows.size(0) == 0:
+            if ctx is None:
+                return torch.zeros(self.kg_emb_dim, device=self.device)
+            return ctx.mean(dim=0)
+        return self._attention_and_gating(rows, ctx)
+
     # 获取用户编码
     def encode_user(self, batch, item_embedding, entity_embedding, token_embedding):
         """CPC user encoder: per field fuse the C/P/G pooled preference vectors
@@ -949,7 +1053,7 @@ class HyCoRecModel(BaseModel):
         fused_all, ctx_all = self._cpc_field_preferences(batch, field_x0, xg_by_field)
 
         user_repr_list = [
-            self._attention_and_gating(fused_all[i], ctx_all[i])
+            self._user_from_rows(fused_all[i], ctx_all[i])
             for i in range(len(fused_all))
         ]
         return torch.stack(user_repr_list, dim=0), xg_by_field
@@ -958,8 +1062,20 @@ class HyCoRecModel(BaseModel):
         """E_I for the recommendation head (Eq. 14a / 14b)."""
         if self.ei_mode != "xg" or xg_by_field is None or not self.item_entity_ids:
             return entity_embedding
+        if self.g_unified:
+            return entity_embedding + xg_by_field["G"][: entity_embedding.size(0)]
         xg_i = xg_by_field["item"]  # (n_entity, d) -- item field lives in entity space
         return entity_embedding + xg_i
+
+    def _word_table(self):
+        """Word X^(0). ``word_rgcn: false`` skips the RGCN, which runs over the
+        *entity* KG and so couples word id k to entity id k (control for the
+        word-index issue, spec checklist 0)."""
+        if not self.word_rgcn:
+            return self.word_embedding.weight
+        return self.word_encoder(
+            self.word_embedding.weight, self.edge_idx, self.edge_type
+        )
 
     # 推荐模块
     def recommend(self, batch, mode):
@@ -970,9 +1086,7 @@ class HyCoRecModel(BaseModel):
         entity_embedding = self.entity_encoder(
             self.entity_embedding.weight, self.edge_idx, self.edge_type
         )
-        token_embedding = self.word_encoder(
-            self.word_embedding.weight, self.edge_idx, self.edge_type
-        )
+        token_embedding = self._word_table()
 
         user_embedding, xg_by_field = self.encode_user(
             batch, item_embedding, entity_embedding, token_embedding
@@ -995,6 +1109,7 @@ class HyCoRecModel(BaseModel):
             self.entity_encoder,
             self.word_encoder,
             self.hconv,
+            *([self.hconv_p, self.hconv_g] if self.scope_weights == "separate" else []),
             self.fusion,
             self.item_attn,
             self.rec_bias,
@@ -1161,9 +1276,7 @@ class HyCoRecModel(BaseModel):
         entity_embedding = self.entity_encoder(
             self.entity_embedding.weight, self.edge_idx, self.edge_type
         )
-        token_embedding = self.word_encoder(
-            self.word_embedding.weight, self.edge_idx, self.edge_type
-        )
+        token_embedding = self._word_table()
 
         # 获取对话编码
         session_state = self.encode_session(

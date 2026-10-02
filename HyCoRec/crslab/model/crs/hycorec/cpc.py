@@ -16,6 +16,7 @@ The per-scope hypergraph convolution itself reuses ``CustomHypergraphConv`` from
 """
 
 import os
+import random
 
 import numpy as np
 import scipy.sparse as sp
@@ -25,18 +26,30 @@ from torch import nn
 FIELDS = ("item", "entity", "word")
 
 
-def khop_closure(seeds, adj, k):
+def khop_closure(seeds, adj, k, max_neighbors=None):
     """BFS k-hop closure over ``adj`` (``dict[int, list[int]]``).
 
     Returns the set of node ids reachable within ``k`` hops of ``seeds``
     (seeds included). ``k <= 0`` returns just the seed set.
+
+    ``max_neighbors``, if set, caps how many neighbors a single hop
+    contributes per frontier node (deterministic subsample seeded by the
+    node id). Some KG adjacencies here have extreme long-tail degree (e.g.
+    HTGReDial's entity_adj: max degree ~20.6k, mean 8.4 vs HReDial's mean
+    2.4) -- one mentioned hub entity can otherwise blow a single sample's
+    P-scope hyperedge up to tens of thousands of nodes, which is what made
+    HTGReDial's full run ~16x slower than HReDial's and OOM'd at a larger
+    batch size.
     """
     seen = set(seeds)
     frontier = set(seeds)
     for _ in range(max(0, k)):
         nxt = set()
         for u in frontier:
-            nxt.update(adj.get(u, ()))
+            neighbors = adj.get(u, ())
+            if max_neighbors is not None and len(neighbors) > max_neighbors:
+                neighbors = random.Random(u).sample(list(neighbors), max_neighbors)
+            nxt.update(neighbors)
         nxt -= seen
         if not nxt:
             break
@@ -131,14 +144,21 @@ class CollectivePropagation:
 
 
 def load_collective(path, fields=FIELDS):
-    """Load ``A_hat_<field>.npz`` (scipy CSR) written by ``scripts/build_collective.py``."""
+    """Load ``A_hat_<field>.npz`` (scipy CSR) written by ``scripts/build_collective.py``.
+
+    Stored as torch sparse CSR (not COO): ``torch.sparse.mm`` on CUDA is
+    ~6-7x faster in CSR for these matrices (measured on the HTGReDial word
+    field, n=30001, nnz=21.3M: 43ms/mm COO vs 6ms/mm CSR), with numerically
+    identical output -- this is the dominant per-step cost of the G scope.
+    """
     a_hat = {}
     for f in fields:
         fp = os.path.join(path, f"A_hat_{f}.npz")
-        m = sp.load_npz(fp).tocoo()
-        idx = torch.tensor(np.vstack([m.row, m.col]), dtype=torch.long)
+        m = sp.load_npz(fp).tocsr()
+        crow = torch.tensor(m.indptr, dtype=torch.int64)
+        col = torch.tensor(m.indices, dtype=torch.int64)
         val = torch.tensor(m.data, dtype=torch.float)
-        a_hat[f] = torch.sparse_coo_tensor(idx, val, tuple(m.shape)).coalesce()
+        a_hat[f] = torch.sparse_csr_tensor(crow, col, val, tuple(m.shape))
     return CollectivePropagation(a_hat)
 
 

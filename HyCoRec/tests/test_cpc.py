@@ -198,3 +198,60 @@ def test_history_sessions_capped_and_item_bearing():
     sessions = build_history_sessions(history, k_hist=40)
     assert 0 < len(sessions) <= 40  # capped, and the movie-less session dropped
     assert all(len(items) >= 1 for items, _e, _w in sessions)
+
+
+# --------------------------------------------------------------------------
+# v2.2 fusion (rows7): Eq. 12-13 and the 3.4 cold-start table
+# --------------------------------------------------------------------------
+def _rows7_stub(d=8):
+    from types import SimpleNamespace
+
+    from crslab.model.crs.hycorec.attention import MHItemAttention
+    from crslab.model.crs.hycorec.hycorec import HyCoRecModel
+
+    m = SimpleNamespace(
+        kg_emb_dim=d,
+        device=torch.device("cpu"),
+        pooling="Mean",
+        item_attn=MHItemAttention(d, 4),
+    )
+    m._attention_and_gating = lambda r, c: HyCoRecModel._attention_and_gating(m, r, c)
+    return m, lambda r, c: HyCoRecModel._user_from_rows(m, r, c)
+
+
+def test_rows7_cold_start_table():
+    d = 8
+    _, user = _rows7_stub(d)
+    rows, ctx = torch.randn(5, d), torch.randn(3, d)
+    assert torch.allclose(user(rows, None), rows.mean(0), atol=1e-6)  # n_c = 0
+    empty = torch.zeros(0, d)
+    assert torch.allclose(user(empty, ctx), ctx.mean(0))  # no rows
+    assert torch.equal(user(empty, None), torch.zeros(d))  # both empty
+
+
+def test_rows7_matches_eq13_mean_pool():
+    d = 8
+    m, user = _rows7_stub(d)
+    rows, ctx = torch.randn(4, d), torch.randn(3, d)
+    n_tilde = m.item_attn(rows, ctx)
+    expected = (n_tilde.mean(0) + ctx.sum(0)) / (ctx.size(0) + 1)
+    assert torch.allclose(user(rows, ctx), expected, atol=1e-5)
+
+
+def test_scope_weights_separate_vs_shared():
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    from crslab.model.crs.hycorec.hycorec import HyCoRecModel
+
+    mk = lambda: nn.ModuleDict({f: nn.ModuleList([nn.Linear(2, 2)]) for f in ("item", "entity", "word", "G")})
+    m = SimpleNamespace(hconv=mk(), hconv_p=mk(), hconv_g=mk(), scope_weights="separate")
+    st = lambda sc, f: HyCoRecModel._stack_for(m, sc, f)
+    assert st("C", "entity") is m.hconv["entity"]
+    assert st("P", "entity") is m.hconv_p["entity"]
+    assert st("G", "G") is m.hconv_g["G"]
+    ids = {id(st(sc, "entity")) for sc in "CPG"}
+    assert len(ids) == 3
+    m.scope_weights = "shared"
+    assert all(st(sc, "entity") is m.hconv["entity"] for sc in "CPG")
