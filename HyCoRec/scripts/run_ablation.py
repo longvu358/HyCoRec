@@ -12,6 +12,8 @@ Usage:
     uv run scripts/run_ablation.py run --seeds 3407 42 123           # spec-mandated x3
     uv run scripts/run_ablation.py run --cells A0 A1 A2 --seeds 3407 # subset
     uv run scripts/run_ablation.py summarize                        # rebuild tables only
+    uv run scripts/run_ablation.py run --cells A9 A9_v22_sep --seeds 3407   # ReDial v2.1 vs v2.2-sep
+    uv run scripts/run_ablation.py run --cells T9 T9_norev --seeds 3407     # HTGReDial, review on/off
 
 Two cells from the spec's table (docs/contexual_personal_collective/
 cpc_hypergraph_v2.1_method_spec.md §6.2) are BLOCKED and skipped by default:
@@ -29,7 +31,10 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import re
+import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -76,6 +81,20 @@ EXTRA = {
     "A10b1": "A10b1.yaml",
 }
 
+# Variant / TG cells: not in the default ladder, select with --cells.
+#   A9_rows7, A9_v22*  ReDial CPC v2.2 variants (need data/collective/hredial_unified_full)
+#   T9, T9_norev       HTGReDial full / review-off control (need data/collective/htgredial_full
+#                      and data/reviews/htgredial/review_index.json for T9)
+# Results of different datasets never mix: summaries are keyed by cell name.
+VARIANTS = {
+    "A9_rows7": "A9_rows7.yaml",
+    "A9_v22": "A9_v22.yaml",
+    "A9_v22_noword": "A9_v22_noword.yaml",
+    "A9_v22_sep": "A9_v22_sep.yaml",
+    "T9": "T9.yaml",
+    "T9_norev": "T9_norev.yaml",
+}
+
 REC_METRIC_KEYS = [
     "recall@1", "recall@10", "recall@50",
     "mrr@1", "mrr@10", "mrr@50",
@@ -113,7 +132,8 @@ def build_run_config(cell: str, cfg_file: str, seed: int, log_name: str | None =
 def parse_log(log_path: Path) -> dict:
     """Extract final rec/conv test metrics + alpha_f table from a run's log file."""
     out = {
-        "rec_test": None, "conv_test": None, "alpha": None,
+        "rec_test": None, "conv_test": None, "rec_valid": None, "conv_valid": None,
+        "alpha": None,
         "epochs_rec": 0, "epochs_conv": 0, "early_stopped": False,
         "reached_conv_test": False, "wall_seconds": None,
     }
@@ -123,6 +143,7 @@ def parse_log(log_path: Path) -> dict:
     lines = log_path.read_text(errors="replace").splitlines()
     stage = None
     mode = None
+    last_rec_valid = last_conv_valid = None
     first_ts = last_ts = None
     i = 0
     while i < len(lines):
@@ -156,10 +177,16 @@ def parse_log(log_path: Path) -> dict:
             except json.JSONDecodeError:
                 data = None
             if data is not None and stage and mode:
-                if stage == "rec" and mode == "test":
+                if stage == "rec" and mode == "valid":
+                    last_rec_valid = data
+                elif stage == "rec" and mode == "test":
                     out["rec_test"] = data
+                    out["rec_valid"] = last_rec_valid
+                elif stage == "conv" and mode == "valid":
+                    last_conv_valid = data
                 elif stage == "conv" and mode == "test":
                     out["conv_test"] = data
+                    out["conv_valid"] = last_conv_valid
                     out["reached_conv_test"] = True
             i += 1
         i += 1
@@ -183,16 +210,24 @@ def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float 
 
     print(f"==> [{rid}] launching (config={run_cfg.relative_to(ROOT)}, gpu={gpu}, debug={debug})", flush=True)
     t0 = time.time()
-    cmd = ["uv", "run", "run_crslab.py", "-c", str(run_cfg.relative_to(ROOT)), "-g", gpu, "-s", str(seed)]
+    runner = ["uv", "run"] if shutil.which("uv") else [sys.executable]
+    cmd = runner + ["run_crslab.py", "-c", str(run_cfg.relative_to(ROOT)), "-g", gpu, "-s", str(seed)]
     if debug:
         cmd.append("-d")
     result = {"cell": cell, "seed": seed, "profile": profile, "config": cfg_file, "run_id": rid, "cmd": " ".join(cmd)}
     try:
         with open(stderr_path, "w") as errf:
-            proc = subprocess.run(
-                cmd, cwd=ROOT, stderr=errf, stdout=subprocess.DEVNULL,
-                timeout=timeout_hours * 3600 if timeout_hours else None,
+            # own process group: on timeout kill the whole tree, not just the
+            # `uv run` wrapper (otherwise run_crslab.py keeps training orphaned).
+            proc = subprocess.Popen(
+                cmd, cwd=ROOT, stderr=errf, stdout=subprocess.DEVNULL, start_new_session=True,
             )
+            try:
+                proc.wait(timeout=timeout_hours * 3600 if timeout_hours else None)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+                raise
         result["returncode"] = proc.returncode
     except subprocess.TimeoutExpired:
         result["returncode"] = None
@@ -239,6 +274,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             cells[name] = LADDER[name]
         elif name in EXTRA:
             cells[name] = EXTRA[name]
+        elif name in VARIANTS:
+            cells[name] = VARIANTS[name]
         elif name in BLOCKED:
             print(f"!! skipping {name}: BLOCKED ({BLOCKED[name]})")
         else:
@@ -250,6 +287,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"!! unknown --gpu-profile {args.gpu_profile!r}, choices: {list(GPU_PROFILES)}")
         sys.exit(1)
     cfg_dir = GPU_PROFILES[args.gpu_profile]
+
+    missing = {c: f for c, f in cells.items() if not (cfg_dir / f).is_file()}
+    for c, f in missing.items():
+        print(f"!! skipping {c}: {cfg_dir.relative_to(ROOT) / f} does not exist for --gpu-profile {args.gpu_profile}")
+    cells = {c: f for c, f in cells.items() if c not in missing}
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     results_path = RESULTS_DIR / "results.jsonl"
@@ -271,6 +313,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     build_summary(results_path)
+    build_val_summary(results_path)
 
 
 def mean_std(vals: list[float]) -> str:
@@ -282,11 +325,13 @@ def mean_std(vals: list[float]) -> str:
     return f"{statistics.mean(vals):.4f}±{statistics.pstdev(vals):.4f}"
 
 
-def build_summary(results_path: Path) -> None:
+def build_summary(results_path: Path, profile_filter: str | None = None) -> None:
     if not results_path.exists():
         print("No results yet.")
         return
     rows = [json.loads(l) for l in results_path.read_text().splitlines() if l.strip()]
+    if profile_filter is not None:
+        rows = [r for r in rows if r.get("profile", "default") == profile_filter]
 
     def label(r: dict) -> str:
         profile = r.get("profile", "default")
@@ -294,11 +339,13 @@ def build_summary(results_path: Path) -> None:
 
     by_cell: dict[str, list[dict]] = {}
     for r in rows:
-        if r.get("error"):
+        # keep partial rows (e.g. rec finished, conv got interrupted) -- only
+        # drop rows with no usable metrics at all.
+        if not r.get("rec_test") and not r.get("conv_test"):
             continue
         by_cell.setdefault(label(r), []).append(r)
 
-    order = list(LADDER) + list(EXTRA)
+    order = list(LADDER) + list(EXTRA) + list(VARIANTS)
     cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
 
     rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
@@ -337,14 +384,70 @@ def build_summary(results_path: Path) -> None:
     print(f"Wrote {out.relative_to(ROOT)} ({len(rows)} total runs, {len(failed)} failed)")
 
 
+def build_val_summary(results_path: Path, profile_filter: str | None = None) -> None:
+    """Same tables as build_summary but sourced from the best-checkpoint valid
+    reports (the [Valid] block right before the model is restored for [Test]),
+    re-parsed from each run's log file -- results.jsonl predates rec_valid/
+    conv_valid, so this never trusts stale jsonl fields for those keys."""
+    if not results_path.exists():
+        print("No results yet.")
+        return
+    rows = [json.loads(l) for l in results_path.read_text().splitlines() if l.strip()]
+    if profile_filter is not None:
+        rows = [r for r in rows if r.get("profile", "default") == profile_filter]
+
+    def label(r: dict) -> str:
+        profile = r.get("profile", "default")
+        return r["cell"] if profile == "default" else f"{r['cell']} [{profile}]"
+
+    by_cell: dict[str, list[dict]] = {}
+    for r in rows:
+        if not r.get("log_path"):
+            continue
+        reparsed = parse_log(ROOT / r["log_path"])
+        if not reparsed["rec_valid"] and not reparsed["conv_valid"]:
+            continue
+        r = {**r, "rec_valid": reparsed["rec_valid"], "conv_valid": reparsed["conv_valid"]}
+        by_cell.setdefault(label(r), []).append(r)
+
+    order = list(LADDER) + list(EXTRA) + list(VARIANTS)
+    cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
+
+    rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
+                 "|---" * (len(REC_METRIC_KEYS) + 2) + "|"]
+    conv_lines = ["| cell | n | " + " | ".join(CONV_METRIC_KEYS) + " |",
+                  "|---" * (len(CONV_METRIC_KEYS) + 2) + "|"]
+
+    for cell in cells_present:
+        runs = by_cell[cell]
+        rec_vals = {k: [r["rec_valid"].get(k) for r in runs if r.get("rec_valid")] for k in REC_METRIC_KEYS}
+        conv_vals = {k: [r["conv_valid"].get(k) for r in runs if r.get("conv_valid")] for k in CONV_METRIC_KEYS}
+        rec_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(rec_vals[k]) for k in REC_METRIC_KEYS) + " |")
+        conv_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(conv_vals[k]) for k in CONV_METRIC_KEYS) + " |")
+
+    out = RESULTS_DIR / "summary_val.md"
+    out.write_text(
+        "# Ablation results (spec 6.2) -- validation split\n\n"
+        "Same cells/runs as summary.md, but every metric is the best-checkpoint "
+        "[Valid] report (the epoch restored just before [Test] runs), not the held-out test set. "
+        "Use this to sanity-check test numbers against overfitting/selection noise, not as a substitute for summary.md.\n\n"
+        f"Blocked cells (not runnable in current codebase): "
+        + ", ".join(f"{k} ({v})" for k, v in BLOCKED.items()) + "\n\n"
+        "## Recommendation metrics (valid)\n\n" + "\n".join(rec_lines) + "\n\n"
+        "## Conversation metrics (valid)\n\n" + "\n".join(conv_lines) + "\n"
+    )
+    print(f"Wrote {out.relative_to(ROOT)} ({len(rows)} total runs)")
+
+
 def cmd_summarize(args: argparse.Namespace) -> None:
-    build_summary(RESULTS_DIR / "results.jsonl")
+    build_summary(RESULTS_DIR / "results.jsonl", profile_filter=args.gpu_profile)
+    build_val_summary(RESULTS_DIR / "results.jsonl", profile_filter=args.gpu_profile)
 
 
 def cmd_smoke(args: argparse.Namespace) -> None:
     """Fast harness check: trains on the (small) valid split via run_crslab.py -d.
     Does NOT write to results.jsonl / summary.md -- just proves the plumbing works."""
-    cfg_file = LADDER.get(args.cell) or EXTRA.get(args.cell)
+    cfg_file = LADDER.get(args.cell) or EXTRA.get(args.cell) or VARIANTS.get(args.cell)
     if not cfg_file:
         print(f"unknown cell {args.cell!r}")
         sys.exit(1)
@@ -363,7 +466,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="run (missing) ablation cells and rebuild the summary")
-    p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = full spec ladder minus A4/A11")
+    p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = full spec ladder minus A4/A11; also A9_rows7/A9_v22*/T9/T9_norev")
     p_run.add_argument("--include-extra", action="store_true", help="also run the non-spec debug configs (A3b, A9b1, A10b1)")
     p_run.add_argument("--seeds", nargs="+", type=int, default=[3407], help="spec asks for x3 seeds")
     p_run.add_argument("--gpu", default="0", help="GPU id string for run_crslab.py -g (use -1 for CPU)")
@@ -375,6 +478,8 @@ def main() -> None:
     p_run.set_defaults(func=cmd_run)
 
     p_sum = sub.add_parser("summarize", help="rebuild results/ablation/summary.md from results.jsonl without training")
+    p_sum.add_argument("--gpu-profile", default=None, choices=list(GPU_PROFILES),
+                        help="only summarize runs from this profile (default: all profiles)")
     p_sum.set_defaults(func=cmd_summarize)
 
     p_smoke = sub.add_parser("smoke", help="fast harness check on the valid split (run_crslab.py -d); does not touch results.jsonl")
