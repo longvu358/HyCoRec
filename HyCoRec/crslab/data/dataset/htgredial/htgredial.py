@@ -21,14 +21,13 @@ References:
 import json
 import os
 import pickle as pkl
-from copy import copy
 
 from loguru import logger
-from tqdm import tqdm
 
 from crslab.config import DATASET_PATH
 from crslab.data.dataset.base import BaseDataset
 from crslab.data.dataset.htgredial.resources import resources
+from crslab.data.dataset.hycorec_common import process_grouped_raw_data
 
 
 class HTGReDialDataset(BaseDataset):
@@ -161,112 +160,14 @@ class HTGReDialDataset(BaseDataset):
         )
 
     def _raw_data_process(self, raw_data):
-        augmented_convs = [
-            self._convert_to_id(conv) for convs in tqdm(raw_data) for conv in convs
-        ]
-        augmented_conv_dicts = []
-        for conv in tqdm(augmented_convs):
-            augmented_conv_dicts.extend(self._augment_and_add(conv))
-        return augmented_conv_dicts
+        """Process the per-user-grouped raw data into per-turn samples.
 
-    # 将文本、电影、实体信息转换为序号
-    def _convert_to_id(self, conversation):
-        augmented_convs = []
-        last_role = None
-        conv_id = conversation["conv_id"]
-        related_item = []
-        related_entity = []
-        related_word = []
-        for utt in conversation["dialog"]:
-            self.unk_token_idx = 3
-            text_token_ids = [
-                self.tok2ind.get(word, self.unk_token_idx) for word in utt["text"]
-            ]
-            item_ids = [
-                self.entity2id[movie]
-                for movie in utt["movies"]
-                if movie in self.entity2id
-            ]
-            entity_ids = [
-                self.entity2id[entity]
-                for entity in utt["entity"]
-                if entity in self.entity2id
-            ]
-            word_ids = [
-                self.tok2ind[word] for word in utt["text"] if word in self.tok2ind
-            ]
-
-            related_item += item_ids
-            related_entity += entity_ids
-            related_word += word_ids
-
-            if utt["role"] == last_role:
-                augmented_convs[-1]["text"] += text_token_ids
-                augmented_convs[-1]["item"] += item_ids
-                augmented_convs[-1]["entity"] += entity_ids
-                augmented_convs[-1]["word"] += word_ids
-            else:
-                augmented_convs.append(
-                    {
-                        "conv_id": conv_id,
-                        "role": utt["role"],
-                        "text": text_token_ids,
-                        "item": related_item,
-                        "entity": related_entity,
-                        "word": related_word,
-                    }
-                )
-            last_role = utt["role"]
-
-        return augmented_convs
-
-    def _augment_and_add(self, raw_conv_dict):
-        augmented_conv_dicts = []
-        context_tokens, context_entities, context_words, context_items = [], [], [], []
-        # Incremental full-history accumulators (dedup'd for entity/word, kept
-        # in first-occurrence order), updated by O(new elements) per turn.
-        # Snapshotting these instead of re-flattening context_* downstream
-        # avoids redoing an O(turns) flatten+dedup pass at every turn, which
-        # would cost O(turns^2) per conversation over the whole dataset.
-        global_items = []
-        global_entities, entity_seen = [], set()
-        global_words, word_seen = [], set()
-        for i, conv in enumerate(raw_conv_dict):
-            text_tokens, entities, movies, words = (
-                conv["text"],
-                conv["entity"],
-                conv["item"],
-                conv["word"],
-            )
-            if len(context_tokens) > 0:
-                conv_dict = {
-                    "conv_id": conv["conv_id"],
-                    "role": conv["role"],
-                    "tokens": copy(context_tokens),
-                    "response": text_tokens,
-                    "item": copy(context_items),
-                    "entity": copy(context_entities),
-                    "word": copy(context_words),
-                    "item_global": list(global_items),
-                    "entity_global": list(global_entities),
-                    "word_global": list(global_words),
-                    "items": movies,
-                }
-                augmented_conv_dicts.append(conv_dict)
-
-            context_tokens.append(text_tokens)
-            context_items.append(movies)
-            context_entities.append(entities + movies)
-            context_words.append(words)
-
-            global_items += movies
-            for entity in entities + movies:
-                if entity not in entity_seen:
-                    entity_seen.add(entity)
-                    global_entities.append(entity)
-            for word in words:
-                if word not in word_seen:
-                    word_seen.add(word)
-                    global_words.append(word)
-
-        return augmented_conv_dicts
+        ``raw_data`` is ``list[list[conv]]`` grouped by user; the last conv of a
+        group is the target session and the earlier ones are ``D_u(d)``. See
+        ``crslab.data.dataset.hycorec_common``.
+        """
+        unk_idx = self.tok2ind.get("__unk__", 3)
+        k_hist = self.opt.get("k_hist", 40)
+        return process_grouped_raw_data(
+            raw_data, self.tok2ind, self.entity2id, unk_idx, k_hist
+        )

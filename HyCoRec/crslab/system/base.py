@@ -247,6 +247,7 @@ class BaseSystem(ABC):
             self.best_valid = metric
             self.drop_cnt = 0
             logger.info('[Get new best model]')
+            self.save_model()
             return False
         else:
             self.drop_cnt += 1

@@ -1,0 +1,78 @@
+{
+  "quality": {
+    "n_movies": 2711,
+    "n_movies_empty": 18,
+    "n_movies_with_internal_dup_reviews": 369,
+    "reviews_per_movie": {
+      "min": 0,
+      "max": 100,
+      "mean": 25.93,
+      "median": 1
+    },
+    "words_per_review": {
+      "min": 1,
+      "max": 1869,
+      "mean": 211.1,
+      "median": 154.0,
+      "p10": 44
+    },
+    "non_ascii_flagged": 12,
+    "n_reviews_total": 70290,
+    "junk_examples_lt5_words": [
+      [
+        "200177",
+        "SPOILERS"
+      ],
+      [
+        "196085",
+        "Problems With Spiders:"
+      ],
+      [
+        "196085",
+        "0.01/10"
+      ],
+      [
+        "196085",
+        "Problems With Spiders:"
+      ],
+      [
+        "204904",
+        "My Rating : 8/10"
+      ]
+    ]
+  },
+  "coverage": {
+    "n_items_V_I": 6515,
+    "n_items_in_revcore_catalog": 5397,
+    "catalog_coverage_pct": 82.8,
+    "n_items_with_actual_reviews": 2104,
+    "review_coverage_pct": 32.3
+  },
+  "cross_check": {
+    "split": "test",
+    "n_entity_refs": 24574,
+    "resolved_via_revcore_64k_vocab": 24574,
+    "resolved_pct": 100.0,
+    "of_which_is_a_movie": 2882,
+    "of_which_movie_has_reviews": 1039,
+    "expected_movie_has_reviews_pct_if_random": 39.2,
+    "observed_movie_has_reviews_pct": 36.1,
+    "examples": [
+      {
+        "conv_idx": "0",
+        "entity_uri": "<http://dbpedia.org/resource/The_Purge:_Anarchy>",
+        "review_excerpt": "I almost didn't bother with this sequel . The first movie was close but no cigar down to rather lazy and ill thought plotting and since this movie was also written and directed by James DeMonaco we'd "
+      },
+      {
+        "conv_idx": "1",
+        "entity_uri": "<http://dbpedia.org/resource/The_Purge:_Anarchy>",
+        "review_excerpt": "I almost didn't bother with this sequel . The first movie was close but no cigar down to rather lazy and ill thought plotting and since this movie was also written and directed by James DeMonaco we'd "
+      },
+      {
+        "conv_idx": "2",
+        "entity_uri": "<http://dbpedia.org/resource/The_Purge:_Anarchy>",
+        "review_excerpt": "I almost didn't bother with this sequel . The first movie was close but no cigar down to rather lazy and ill thought plotting and since this movie was also written and directed by James DeMonaco we'd "
+      }
+    ]
+  }
+}

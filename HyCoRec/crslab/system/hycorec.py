@@ -10,6 +10,7 @@ import torch
 import pickle as pkl
 from loguru import logger
 
+from crslab.config import DATA_PATH
 from crslab.evaluator.metrics.base import AverageMetric
 from crslab.evaluator.metrics.gen import PPLMetric
 from crslab.system.base import BaseSystem
@@ -41,6 +42,7 @@ class HyCoRecSystem(BaseSystem):
         self.ind2tok = vocab['ind2tok']
         self.end_token_idx = vocab['tok2ind']['__end__']
         self.item_ids = side_data['item_entity_ids']
+        self.tail_item_ids = self._load_tail_items(opt)
 
         self.rec_optim_opt = opt['rec']
         self.conv_optim_opt = opt['conv']
@@ -48,6 +50,19 @@ class HyCoRecSystem(BaseSystem):
         self.conv_epoch = self.conv_optim_opt['epoch']
         self.rec_batch_size = self.rec_optim_opt['batch_size']
         self.conv_batch_size = self.conv_optim_opt['batch_size']
+
+    @staticmethod
+    def _load_tail_items(opt):
+        """Long-tail item ids (bottom 80% by train frequency, CPC-Hypergraph v2
+        spec 6.1), precomputed by build_collective.py. Returns an empty set
+        (Tail-Recall reports 0 samples, harmless) if it hasn't been built yet."""
+        path = os.path.join(DATA_PATH, "collective", opt['dataset'].lower(), "tail_items.json")
+        if not os.path.isfile(path):
+            logger.warning(f"[Tail-Recall] no tail_items.json at {path}; run build_collective.py. "
+                            f"tail_recall@k will be empty.")
+            return set()
+        with open(path, encoding="utf-8") as f:
+            return set(json.load(f))
 
     def rec_evaluate(self, rec_predict, item_label):
         rec_predict = rec_predict.cpu()
@@ -57,8 +72,11 @@ class HyCoRecSystem(BaseSystem):
         item_label = item_label.tolist()
         # start = perf_counter()
         for rec_rank, label in zip(rec_ranks, item_label):
+            is_tail = label in self.tail_item_ids
             label = self.item_ids.index(label)
             self.evaluator.rec_evaluate(rec_rank, label)
+            if is_tail:
+                self.evaluator.rec_evaluate_tail(rec_rank, label)
         # print(f"{perf_counter() - start}")
 
     def conv_evaluate(self, prediction, response, batch_user_id=None, batch_conv_id=None):
@@ -124,9 +142,12 @@ class HyCoRecSystem(BaseSystem):
                     self.step(batch, stage='rec', mode='valid')
                 self.evaluator.report(epoch=epoch, mode='valid')
                 # early stop
-                metric = self.evaluator.optim_metrics['rec_loss']
+                metric = self.evaluator.rec_metrics['recall@50']
+                self.adjust_lr(metric)
                 if self.early_stop(metric):
                     break
+        if self.need_early_stop:
+            self.restore_model()
         # test
         logger.info('[Test]')
         with torch.no_grad():
@@ -134,6 +155,8 @@ class HyCoRecSystem(BaseSystem):
             for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                 self.step(batch, stage='rec', mode='test')
             self.evaluator.report(mode='test')
+        fusion = getattr(self.model, 'module', self.model).fusion
+        logger.info(f'[Scope fusion weights alpha_f] {fusion.weight_table()}')
 
     def train_conversation(self):
         if os.environ["CUDA_VISIBLE_DEVICES"] == '-1':
@@ -158,6 +181,7 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.report(epoch=epoch, mode='valid')
                 # early stop
                 metric = self.evaluator.optim_metrics['gen_loss']
+                self.adjust_lr(metric)
                 if self.early_stop(metric):
                     break
         # test

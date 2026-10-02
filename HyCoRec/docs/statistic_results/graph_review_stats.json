@@ -1,0 +1,266 @@
+{
+  "hredial": {
+    "degree": {
+      "item": {
+        "n_nodes": 64362,
+        "mean": 2.4,
+        "median": 1,
+        "p90": 2,
+        "p99": 4,
+        "max": 12647,
+        "n_deg_gt_100": 64,
+        "n_deg_gt_1000": 15,
+        "top1pct_edge_share": 51.8,
+        "top5": [
+          [
+            "<http://dbpedia.org/resource/Tracy_Middendorf>",
+            12647
+          ],
+          [
+            "<http://dbpedia.org/resource/Lenny_Kravitz>",
+            10472
+          ],
+          [
+            "<http://dbpedia.org/resource/May'n>",
+            6926
+          ],
+          [
+            "<http://dbpedia.org/resource/World_War_II_Victory_Medal>",
+            5309
+          ],
+          [
+            "<http://dbpedia.org/resource/Bentley,_Kansas>",
+            3863
+          ]
+        ]
+      },
+      "entity": {
+        "n_nodes": 64362,
+        "mean": 2.4,
+        "median": 1,
+        "p90": 2,
+        "p99": 4,
+        "max": 12647,
+        "n_deg_gt_100": 64,
+        "n_deg_gt_1000": 15,
+        "top1pct_edge_share": 51.8,
+        "top5": [
+          [
+            "<http://dbpedia.org/resource/Tracy_Middendorf>",
+            12647
+          ],
+          [
+            "<http://dbpedia.org/resource/Lenny_Kravitz>",
+            10472
+          ],
+          [
+            "<http://dbpedia.org/resource/May'n>",
+            6926
+          ],
+          [
+            "<http://dbpedia.org/resource/World_War_II_Victory_Medal>",
+            5309
+          ],
+          [
+            "<http://dbpedia.org/resource/Bentley,_Kansas>",
+            3863
+          ]
+        ]
+      },
+      "word": {
+        "n_nodes": 8312,
+        "mean": 17.1,
+        "median": 7,
+        "p90": 45,
+        "p99": 131,
+        "max": 812,
+        "n_deg_gt_100": 173,
+        "n_deg_gt_1000": 0,
+        "top1pct_edge_share": 10.8,
+        "top5": [
+          [
+            "person",
+            812
+          ],
+          [
+            "people",
+            379
+          ],
+          [
+            "action",
+            335
+          ],
+          [
+            "music",
+            327
+          ],
+          [
+            "legal",
+            272
+          ]
+        ]
+      }
+    },
+    "review_info": {
+      "train": {
+        "n_conv": 14362,
+        "pct_nonempty": 68.2,
+        "ents_per_nonempty_mean": 2.51,
+        "pct_ent_in_vocab": 54.8,
+        "pct_ent_is_item": 9.4,
+        "n_distinct_ents": 1329,
+        "tokens_per_review_mean": 11.3
+      },
+      "valid": {
+        "n_conv": 10256,
+        "pct_nonempty": 70.1,
+        "ents_per_nonempty_mean": 2.62,
+        "pct_ent_in_vocab": 53.5,
+        "pct_ent_is_item": 8.6,
+        "n_distinct_ents": 1206,
+        "tokens_per_review_mean": 11.3
+      },
+      "test": {
+        "n_conv": 14362,
+        "pct_nonempty": 68.2,
+        "ents_per_nonempty_mean": 2.51,
+        "pct_ent_in_vocab": 54.8,
+        "pct_ent_is_item": 9.4,
+        "n_distinct_ents": 1329,
+        "tokens_per_review_mean": 11.3
+      }
+    }
+  },
+  "htgredial": {
+    "degree": {
+      "item": {
+        "n_nodes": 47183,
+        "mean": 8.4,
+        "median": 5,
+        "p90": 9,
+        "p99": 32,
+        "max": 20647,
+        "n_deg_gt_100": 180,
+        "n_deg_gt_1000": 27,
+        "top1pct_edge_share": 34.8,
+        "top5": [
+          [
+            "影视作品",
+            20647
+          ],
+          [
+            "音乐作品",
+            5994
+          ],
+          [
+            "单曲",
+            5805
+          ],
+          [
+            "剧情",
+            5366
+          ],
+          [
+            "歌曲",
+            3923
+          ]
+        ]
+      },
+      "entity": {
+        "n_nodes": 47183,
+        "mean": 8.4,
+        "median": 5,
+        "p90": 9,
+        "p99": 32,
+        "max": 20647,
+        "n_deg_gt_100": 180,
+        "n_deg_gt_1000": 27,
+        "top1pct_edge_share": 34.8,
+        "top5": [
+          [
+            "影视作品",
+            20647
+          ],
+          [
+            "音乐作品",
+            5994
+          ],
+          [
+            "单曲",
+            5805
+          ],
+          [
+            "剧情",
+            5366
+          ],
+          [
+            "歌曲",
+            3923
+          ]
+        ]
+      },
+      "word": {
+        "n_nodes": 16719,
+        "mean": 11.7,
+        "median": 7,
+        "p90": 22,
+        "p99": 85,
+        "max": 2295,
+        "n_deg_gt_100": 121,
+        "n_deg_gt_1000": 1,
+        "top1pct_edge_share": 15.0,
+        "top5": [
+          [
+            "人",
+            2295
+          ],
+          [
+            "地方",
+            737
+          ],
+          [
+            "事情",
+            680
+          ],
+          [
+            "时间",
+            610
+          ],
+          [
+            "专",
+            548
+          ]
+        ]
+      }
+    },
+    "review_info": {
+      "train": {
+        "n_conv": 101397,
+        "pct_nonempty": 52.7,
+        "ents_per_nonempty_mean": 1.75,
+        "pct_ent_in_vocab": 100.0,
+        "pct_ent_is_item": 61.3,
+        "n_distinct_ents": 11447,
+        "tokens_per_review_mean": 44.7
+      },
+      "valid": {
+        "n_conv": 9007,
+        "pct_nonempty": 52.4,
+        "ents_per_nonempty_mean": 1.75,
+        "pct_ent_in_vocab": 100.0,
+        "pct_ent_is_item": 61.8,
+        "n_distinct_ents": 1998,
+        "tokens_per_review_mean": 44.8
+      },
+      "test": {
+        "n_conv": 9000,
+        "pct_nonempty": 52.8,
+        "ents_per_nonempty_mean": 1.74,
+        "pct_ent_in_vocab": 100.0,
+        "pct_ent_is_item": 60.9,
+        "n_distinct_ents": 1986,
+        "tokens_per_review_mean": 44.6
+      }
+    }
+  }
+}

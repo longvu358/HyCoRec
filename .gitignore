@@ -2,10 +2,22 @@
 log/
 __pycache__/
 *.pyc
-HyCoRec/data/
+
 
 uv.lock
 
 polarity_labels
 
 UniCRS
+
+nltk
+pkuseg
+
+compress_data
+**/data/edger
+**/data/conceptnet
+**/data/collective
+**/data/reviews
+
+**/ablation/_runs/
+save

@@ -7,7 +7,6 @@
 # @Author : Kun Zhou, Xiaolei Wang
 # @Email  : francis_kun_zhou@163.com, wxl1999@foxmail.com
 
-import os
 from abc import ABC
 from math import ceil
 
@@ -58,13 +57,27 @@ class BaseDataLoader(ABC):
         self.dataset = dataset
         self.scale = opt.get("scale", 1)
         assert 0 < self.scale <= 1
-        self.num_workers = opt.get("num_workers", os.cpu_count())
+        # Default 0 (single-process, in the main process): rec_batchify/
+        # conv_batchify only pad/build tensors, they don't do any I/O or
+        # heavy per-item work, so worker processes buy nothing but pay
+        # real costs here. get_data() below builds a fresh DataLoader per
+        # epoch, so with num_workers>0 every epoch would pay to spawn a
+        # whole worker pool just to tear it down again, on top of the
+        # pickling/IPC cost of shipping each already-cheap batch back
+        # through a queue - net slower than doing it in-process. Only
+        # raise this in config if collate_fn does real work (e.g. heavy
+        # tokenization/IO per item).
+        self.num_workers = opt.get("num_workers", 0)
         self.pin_memory = opt.get("pin_memory", torch.cuda.is_available())
         # process_fn (e.g. rec_process_fn/conv_process_fn) is a deterministic
         # function of self.dataset, but get_data is invoked once per epoch.
         # Cache its (scaled) output per underlying function so the whole
         # dataset isn't rescanned/rebuilt every epoch.
         self._processed_cache = {}
+        # Cache the DataLoader itself too, so if num_workers > 0 is ever
+        # configured, its worker pool (persistent_workers=True) survives
+        # across epochs instead of being spawned/torn down every time.
+        self._loader_cache = {}
 
     def _get_processed_dataset(self, process_fn):
         dataset = self.dataset if process_fn is None else None
@@ -91,14 +104,19 @@ class BaseDataLoader(ABC):
         dataset = self._get_processed_dataset(process_fn)
         logger.debug(f"[Dataset size: {len(dataset)}]")
 
-        loader = TorchDataLoader(
-            _SequenceDataset(dataset),
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=batch_fn,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-        )
+        loader_key = (getattr(batch_fn, "__func__", batch_fn), batch_size, shuffle)
+        loader = self._loader_cache.get(loader_key)
+        if loader is None:
+            loader = TorchDataLoader(
+                _SequenceDataset(dataset),
+                batch_size=batch_size,
+                shuffle=shuffle,
+                collate_fn=batch_fn,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.num_workers > 0,
+            )
+            self._loader_cache[loader_key] = loader
 
         for batch in tqdm(loader, total=len(loader)):
             if batch is False:

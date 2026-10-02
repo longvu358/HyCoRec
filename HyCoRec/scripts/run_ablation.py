@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Driver for the CPC-Hypergraph ablation ladder (spec 6.2).
+
+For every (cell, seed) pair it clones the cell's yaml config with a unique
+``log_name``/``model_file``, shells out to ``run_crslab.py``, then parses the
+resulting log for the final rec/conv test metrics and the learned
+scope-fusion weights (alpha_f). Results are appended to a JSONL file (safe to
+resume/rerun) and aggregated into markdown summary tables.
+
+Usage:
+    uv run scripts/run_ablation.py run --seeds 3407                 # 1 seed, full ladder
+    uv run scripts/run_ablation.py run --seeds 3407 42 123           # spec-mandated x3
+    uv run scripts/run_ablation.py run --cells A0 A1 A2 --seeds 3407 # subset
+    uv run scripts/run_ablation.py summarize                        # rebuild tables only
+
+Two cells from the spec's table (docs/contexual_personal_collective/
+cpc_hypergraph_v2.1_method_spec.md §6.2) are BLOCKED and skipped by default:
+  A4  - needs the old MHIM retrieval-extension baseline. `extension_strategy`
+        is read by hycorec.py but never used anywhere else -- the mechanism
+        was dropped in the CPC-Hypergraph refactor.
+  A11 - needs HyCoRec's review Transformer P_r. hycorec.py's own comment
+        ("minus the review Transformer P_r which this codebase lacks") says
+        it was never ported, so there is nothing to "turn off".
+Both need real implementation work before they can be run; see --cells to
+override once that lands.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+ROOT = Path(__file__).resolve().parent.parent  # .../HyCoRec
+ABLATION_CFG_DIR = ROOT / "config" / "crs" / "hycorec" / "ablation"
+RUN_CFG_DIR = ROOT / "config" / "crs" / "hycorec" / "ablation" / "_runs"
+LOG_DIR = ROOT / "log"
+RESULTS_DIR = ROOT / "results" / "ablation"
+
+# GPU profiles: same cell->filename ladder, resolved under a different config
+# subdir with bigger batch_size for beefier hardware (see --gpu-profile).
+GPU_PROFILES = {
+    "default": ABLATION_CFG_DIR,
+    "rtx6000": ABLATION_CFG_DIR / "rtx6000",  # 96GB card: rec/conv batch_size x4
+}
+
+# Required spec ladder (A4, A11 excluded -- see module docstring).
+LADDER = {
+    "A0": "A0.yaml",
+    "A1": "A1.yaml",
+    "A2": "A2.yaml",
+    "A3": "A3.yaml",
+    "A5": "A5.yaml",
+    "A6": "A6.yaml",
+    "A7": "A7.yaml",
+    "A8": "A8.yaml",
+    "A9": "A9.yaml",
+    "A10": "A10.yaml",
+}
+BLOCKED = {
+    "A4": "needs the old MHIM retrieval-extension (extension_strategy is dead code)",
+    "A11": "needs HyCoRec's review Transformer P_r (never implemented in this codebase)",
+}
+# Present in config/.../ablation/ but not part of the spec's required table --
+# left available via --include-extra for debugging, excluded from the default run.
+EXTRA = {
+    "A3b": "A3b.yaml",
+    "A9b1": "A9b1.yaml",
+    "A10b1": "A10b1.yaml",
+}
+
+REC_METRIC_KEYS = [
+    "recall@1", "recall@10", "recall@50",
+    "mrr@1", "mrr@10", "mrr@50",
+    "ndcg@1", "ndcg@10", "ndcg@50",
+    "tail_recall@1", "tail_recall@10", "tail_recall@50",
+]
+CONV_METRIC_KEYS = ["bleu@1", "bleu@2", "bleu@3", "bleu@4", "dist@1", "dist@2", "dist@3", "dist@4", "f1"]
+
+TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+REPORT_RE = re.compile(r"\| (?:crslab\.evaluator\.standard:report|.*:report):\d+ - \s*$")
+STAGE_RE = re.compile(r"\[(Recommendation|Conversation) epoch \d+\]")
+MODE_RE = re.compile(r"- \[(Train|Valid|Test)\]\s*$")
+ALPHA_RE = re.compile(r"\[Scope fusion weights alpha_f\] (\{.*\})\s*$")
+
+
+def run_id(cell: str, seed: int, profile: str = "default") -> str:
+    suffix = "" if profile == "default" else f"_{profile}"
+    return f"ablation_{cell}_seed{seed}{suffix}"
+
+
+def build_run_config(cell: str, cfg_file: str, seed: int, log_name: str | None = None, cfg_dir: Path = ABLATION_CFG_DIR) -> Path:
+    """Clone the cell's yaml with a unique log_name/model_file so parallel/serial
+    reruns never clobber each other's logs or checkpoints."""
+    src = cfg_dir / cfg_file
+    opt = yaml.safe_load(src.read_text())
+    rid = log_name or run_id(cell, seed)
+    opt["log_name"] = rid
+    opt["model_file"] = f"{rid}.pth"
+    RUN_CFG_DIR.mkdir(parents=True, exist_ok=True)
+    dst = RUN_CFG_DIR / f"{rid}.yaml"
+    dst.write_text(yaml.safe_dump(opt, sort_keys=False))
+    return dst
+
+
+def parse_log(log_path: Path) -> dict:
+    """Extract final rec/conv test metrics + alpha_f table from a run's log file."""
+    out = {
+        "rec_test": None, "conv_test": None, "alpha": None,
+        "epochs_rec": 0, "epochs_conv": 0, "early_stopped": False,
+        "reached_conv_test": False, "wall_seconds": None,
+    }
+    if not log_path.exists():
+        return out
+
+    lines = log_path.read_text(errors="replace").splitlines()
+    stage = None
+    mode = None
+    first_ts = last_ts = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = TS_RE.match(line)
+        if m:
+            last_ts = m.group(1)
+            if first_ts is None:
+                first_ts = last_ts
+        if STAGE_RE.search(line):
+            stage = "rec" if "Recommendation" in line else "conv"
+            if stage == "rec" and "[Recommendation epoch" in line:
+                out["epochs_rec"] += 1
+            if stage == "conv" and "[Conversation epoch" in line:
+                out["epochs_conv"] += 1
+        mm = MODE_RE.search(line)
+        if mm:
+            mode = mm.group(1).lower()
+        if "[Early stop]" in line:
+            out["early_stopped"] = True
+        am = ALPHA_RE.search(line)
+        if am:
+            try:
+                out["alpha"] = ast.literal_eval(am.group(1))
+            except (ValueError, SyntaxError):
+                pass
+        if REPORT_RE.search(line) and i + 1 < len(lines):
+            payload = lines[i + 1].strip()
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                data = None
+            if data is not None and stage and mode:
+                if stage == "rec" and mode == "test":
+                    out["rec_test"] = data
+                elif stage == "conv" and mode == "test":
+                    out["conv_test"] = data
+                    out["reached_conv_test"] = True
+            i += 1
+        i += 1
+
+    if first_ts and last_ts:
+        fmt = "%Y-%m-%d %H:%M:%S"
+        out["wall_seconds"] = time.mktime(time.strptime(last_ts, fmt)) - time.mktime(
+            time.strptime(first_ts, fmt)
+        )
+    return out
+
+
+def run_one(cell: str, cfg_file: str, seed: int, gpu: str, timeout_hours: float | None, debug: bool = False, cfg_dir: Path = ABLATION_CFG_DIR, profile: str = "default") -> dict:
+    rid = run_id(cell, seed, profile)
+    if debug:
+        rid += "_debug"
+    run_cfg = build_run_config(cell, cfg_file, seed, log_name=rid, cfg_dir=cfg_dir)
+    stderr_path = LOG_DIR / f"{rid}.stderr"
+    log_path = LOG_DIR / f"{rid}.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"==> [{rid}] launching (config={run_cfg.relative_to(ROOT)}, gpu={gpu}, debug={debug})", flush=True)
+    t0 = time.time()
+    cmd = ["uv", "run", "run_crslab.py", "-c", str(run_cfg.relative_to(ROOT)), "-g", gpu, "-s", str(seed)]
+    if debug:
+        cmd.append("-d")
+    result = {"cell": cell, "seed": seed, "profile": profile, "config": cfg_file, "run_id": rid, "cmd": " ".join(cmd)}
+    try:
+        with open(stderr_path, "w") as errf:
+            proc = subprocess.run(
+                cmd, cwd=ROOT, stderr=errf, stdout=subprocess.DEVNULL,
+                timeout=timeout_hours * 3600 if timeout_hours else None,
+            )
+        result["returncode"] = proc.returncode
+    except subprocess.TimeoutExpired:
+        result["returncode"] = None
+        result["error"] = f"timed out after {timeout_hours}h"
+    result["launch_wall_seconds"] = time.time() - t0
+
+    parsed = parse_log(log_path)
+    result.update(parsed)
+    result["log_path"] = str(log_path.relative_to(ROOT))
+    if result.get("returncode") not in (0, None):
+        result.setdefault("error", f"run_crslab.py exited {result['returncode']}; see {stderr_path.relative_to(ROOT)}")
+    elif result.get("returncode") is None and "error" not in result:
+        result["error"] = "unknown failure"
+    elif not parsed["reached_conv_test"]:
+        result["error"] = "did not reach conversation test stage (see log/stderr)"
+
+    status = "OK" if not result.get("error") else f"FAILED: {result['error']}"
+    print(f"<== [{rid}] {status} ({result['launch_wall_seconds']/60:.1f} min)", flush=True)
+    return result
+
+
+def already_done(results_path: Path, cell: str, seed: int, profile: str = "default") -> bool:
+    if not results_path.exists():
+        return False
+    for line in results_path.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            r.get("cell") == cell
+            and r.get("seed") == seed
+            and r.get("profile", "default") == profile
+            and not r.get("error")
+        ):
+            return True
+    return False
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    cells = {}
+    for name in args.cells or list(LADDER):
+        if name in LADDER:
+            cells[name] = LADDER[name]
+        elif name in EXTRA:
+            cells[name] = EXTRA[name]
+        elif name in BLOCKED:
+            print(f"!! skipping {name}: BLOCKED ({BLOCKED[name]})")
+        else:
+            print(f"!! unknown cell {name!r}, skipping")
+    if args.include_extra:
+        cells.update(EXTRA)
+
+    if args.gpu_profile not in GPU_PROFILES:
+        print(f"!! unknown --gpu-profile {args.gpu_profile!r}, choices: {list(GPU_PROFILES)}")
+        sys.exit(1)
+    cfg_dir = GPU_PROFILES[args.gpu_profile]
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_path = RESULTS_DIR / "results.jsonl"
+
+    plan = [(c, f, s) for c, f in cells.items() for s in args.seeds]
+    print(f"Ablation plan: {len(plan)} runs ({len(cells)} cells x {len(args.seeds)} seeds, gpu-profile={args.gpu_profile})")
+    for cell, _, seed in plan:
+        skip = (not args.force) and already_done(results_path, cell, seed, args.gpu_profile)
+        print(f"  - {cell} seed={seed}" + ("  [skip: already done]" if skip else ""))
+
+    for cell, cfg_file, seed in plan:
+        if (not args.force) and already_done(results_path, cell, seed, args.gpu_profile):
+            continue
+        result = run_one(cell, cfg_file, seed, args.gpu, args.timeout_hours, cfg_dir=cfg_dir, profile=args.gpu_profile)
+        with open(results_path, "a") as f:
+            f.write(json.dumps(result) + "\n")
+        if result.get("error") and args.stop_on_error:
+            print(f"Stopping: {cell} seed={seed} failed and --stop-on-error was set.")
+            sys.exit(1)
+
+    build_summary(results_path)
+
+
+def mean_std(vals: list[float]) -> str:
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return "-"
+    if len(vals) == 1:
+        return f"{vals[0]:.4f}"
+    return f"{statistics.mean(vals):.4f}±{statistics.pstdev(vals):.4f}"
+
+
+def build_summary(results_path: Path) -> None:
+    if not results_path.exists():
+        print("No results yet.")
+        return
+    rows = [json.loads(l) for l in results_path.read_text().splitlines() if l.strip()]
+
+    def label(r: dict) -> str:
+        profile = r.get("profile", "default")
+        return r["cell"] if profile == "default" else f"{r['cell']} [{profile}]"
+
+    by_cell: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("error"):
+            continue
+        by_cell.setdefault(label(r), []).append(r)
+
+    order = list(LADDER) + list(EXTRA)
+    cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
+
+    rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
+                 "|---" * (len(REC_METRIC_KEYS) + 2) + "|"]
+    conv_lines = ["| cell | n | " + " | ".join(CONV_METRIC_KEYS) + " |",
+                  "|---" * (len(CONV_METRIC_KEYS) + 2) + "|"]
+    alpha_lines = ["| cell | seed | field | w_C | w_P | w_G |", "|---|---|---|---|---|---|"]
+
+    for cell in cells_present:
+        runs = by_cell[cell]
+        rec_vals = {k: [r["rec_test"].get(k) for r in runs if r.get("rec_test")] for k in REC_METRIC_KEYS}
+        conv_vals = {k: [r["conv_test"].get(k) for r in runs if r.get("conv_test")] for k in CONV_METRIC_KEYS}
+        rec_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(rec_vals[k]) for k in REC_METRIC_KEYS) + " |")
+        conv_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(conv_vals[k]) for k in CONV_METRIC_KEYS) + " |")
+        for r in runs:
+            if not r.get("alpha"):
+                continue
+            for field, w in r["alpha"].items():
+                alpha_lines.append(f"| {cell} | {r['seed']} | {field} | {w[0]:.3f} | {w[1]:.3f} | {w[2]:.3f} |")
+
+    failed = [r for r in rows if r.get("error")]
+    fail_lines = ["| cell | seed | error |", "|---|---|---|"]
+    for r in failed:
+        fail_lines.append(f"| {label(r)} | {r['seed']} | {r['error']} |")
+
+    out = RESULTS_DIR / "summary.md"
+    out.write_text(
+        "# Ablation results (spec 6.2)\n\n"
+        f"Blocked cells (not runnable in current codebase): "
+        + ", ".join(f"{k} ({v})" for k, v in BLOCKED.items()) + "\n\n"
+        "## Recommendation metrics (test)\n\n" + "\n".join(rec_lines) + "\n\n"
+        "## Conversation metrics (test)\n\n" + "\n".join(conv_lines) + "\n\n"
+        "## Scope-fusion weights alpha_f (post rec-training, per field)\n\n" + "\n".join(alpha_lines) + "\n\n"
+        + (("## Failed runs\n\n" + "\n".join(fail_lines) + "\n") if failed else "")
+    )
+    print(f"Wrote {out.relative_to(ROOT)} ({len(rows)} total runs, {len(failed)} failed)")
+
+
+def cmd_summarize(args: argparse.Namespace) -> None:
+    build_summary(RESULTS_DIR / "results.jsonl")
+
+
+def cmd_smoke(args: argparse.Namespace) -> None:
+    """Fast harness check: trains on the (small) valid split via run_crslab.py -d.
+    Does NOT write to results.jsonl / summary.md -- just proves the plumbing works."""
+    cfg_file = LADDER.get(args.cell) or EXTRA.get(args.cell)
+    if not cfg_file:
+        print(f"unknown cell {args.cell!r}")
+        sys.exit(1)
+    if args.gpu_profile not in GPU_PROFILES:
+        print(f"!! unknown --gpu-profile {args.gpu_profile!r}, choices: {list(GPU_PROFILES)}")
+        sys.exit(1)
+    result = run_one(
+        args.cell, cfg_file, args.seed, args.gpu, args.timeout_hours,
+        debug=True, cfg_dir=GPU_PROFILES[args.gpu_profile], profile=args.gpu_profile,
+    )
+    print(json.dumps(result, indent=2))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_run = sub.add_parser("run", help="run (missing) ablation cells and rebuild the summary")
+    p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = full spec ladder minus A4/A11")
+    p_run.add_argument("--include-extra", action="store_true", help="also run the non-spec debug configs (A3b, A9b1, A10b1)")
+    p_run.add_argument("--seeds", nargs="+", type=int, default=[3407], help="spec asks for x3 seeds")
+    p_run.add_argument("--gpu", default="0", help="GPU id string for run_crslab.py -g (use -1 for CPU)")
+    p_run.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES),
+                        help="config subdir to run from; 'rtx6000' = same ladder, batch_size x4 for a 96GB GPU")
+    p_run.add_argument("--timeout-hours", type=float, default=None, help="kill a single run after N hours")
+    p_run.add_argument("--force", action="store_true", help="rerun cells/seeds that already have a successful result")
+    p_run.add_argument("--stop-on-error", action="store_true")
+    p_run.set_defaults(func=cmd_run)
+
+    p_sum = sub.add_parser("summarize", help="rebuild results/ablation/summary.md from results.jsonl without training")
+    p_sum.set_defaults(func=cmd_summarize)
+
+    p_smoke = sub.add_parser("smoke", help="fast harness check on the valid split (run_crslab.py -d); does not touch results.jsonl")
+    p_smoke.add_argument("--cell", default="A0")
+    p_smoke.add_argument("--seed", type=int, default=3407)
+    p_smoke.add_argument("--gpu", default="0")
+    p_smoke.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES))
+    p_smoke.add_argument("--timeout-hours", type=float, default=1.0)
+    p_smoke.set_defaults(func=cmd_smoke)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

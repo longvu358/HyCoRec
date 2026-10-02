@@ -139,6 +139,96 @@ class MultiHeadAttention(nn.Module):
 
         return out
 
+    def forward_incremental(self, query, key=None, value=None, mask=None, incr_state=None, static_kv=False):
+        """Single-new-token variant of ``forward`` for autoregressive decoding.
+
+        ``query`` must be exactly one timestep (``[B, 1, dim]``). ``incr_state``
+        is the ``(k, v)`` pair returned by the previous call (``None`` on the
+        first step).
+
+        For ``static_kv=True`` (cross-attention against fixed encoder states,
+        e.g. session/related/context), ``key``/``value`` never change between
+        steps, so they are projected once on the first call and the same k/v
+        is reused - not recomputed - on every later step.
+
+        For ``static_kv=False`` (self-attention), this step's new token is
+        projected and appended to the cached k/v prefix, so attention scores
+        for previously-generated tokens are never recomputed.
+
+        This makes each decode step do O(1) new attention work instead of
+        ``forward``'s O(current length) reprocessing of the whole sequence so
+        far. Mathematically identical to calling ``forward`` on the full
+        sequence generated so far and keeping only the last position -
+        verified via ``torch.allclose`` against ``forward``.
+
+        Returns ``(out, new_incr_state)``.
+        """
+        batch_size, query_len, dim = query.size()
+        assert query_len == 1, 'forward_incremental expects a single new token per call'
+        assert dim == self.dim, \
+            f'Dimensions do not match: {dim} query vs {self.dim} configured'
+        n_heads = self.n_heads
+        dim_per_head = dim // n_heads
+        scale = math.sqrt(dim_per_head)
+
+        def prepare_head(tensor):
+            bsz, seq_len, _ = tensor.size()
+            tensor = tensor.view(batch_size, seq_len, n_heads, dim_per_head)
+            tensor = tensor.transpose(1, 2).contiguous().view(
+                batch_size * n_heads,
+                seq_len,
+                dim_per_head
+            )
+            return tensor
+
+        if key is None and value is None:
+            key = value = query
+        elif value is None:
+            value = key
+
+        q = prepare_head(self.q_lin(query))
+
+        if static_kv and incr_state is not None:
+            k, v = incr_state
+        else:
+            new_k = prepare_head(self.k_lin(key))
+            new_v = prepare_head(self.v_lin(value))
+            if incr_state is not None:
+                prev_k, prev_v = incr_state
+                k = torch.cat([prev_k, new_k], dim=1)
+                v = torch.cat([prev_v, new_v], dim=1)
+            else:
+                k, v = new_k, new_v
+
+        key_len = k.size(1)
+        dot_prod = q.div_(scale).bmm(k.transpose(1, 2))
+        # [B * n_heads, 1, key_len]
+
+        if mask is not None:
+            attn_mask = (
+                (mask == 0)
+                    .view(batch_size, 1, -1, key_len)
+                    .repeat(1, n_heads, 1, 1)
+                    .expand(batch_size, n_heads, query_len, key_len)
+                    .view(batch_size * n_heads, query_len, key_len)
+            )
+            dot_prod.masked_fill_(attn_mask, neginf(dot_prod.dtype))
+
+        attn_weights = F.softmax(dot_prod, dim=-1).type_as(query)
+        attn_weights = self.attn_dropout(attn_weights)  # --attention-dropout
+
+        attentioned = attn_weights.bmm(v)
+        attentioned = (
+            attentioned.type_as(query)
+                .view(batch_size, n_heads, query_len, dim_per_head)
+                .transpose(1, 2).contiguous()
+                .view(batch_size, query_len, dim)
+        )
+
+        out = self.out_lin(attentioned)
+
+        return out, (k, v)
+
 
 class TransformerFFN(nn.Module):
     def __init__(self, dim, dim_hidden, relu_dropout=.0):
