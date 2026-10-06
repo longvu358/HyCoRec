@@ -1,4 +1,7 @@
-# Ablation A9b1 (CPC-Hypergraph v2, spec 6.2) -- derived from redial.yaml
+# Ablation A9b1 (ReDial, CPC-Hypergraph v2.2 rows7, spec 6.2) -- C + P + G0 (review off), (14b)
+# ReDial ladder: shared hyper-parameters are identical across ALL A* cells (rec/conv: AdamW, lr 5e-4/1e-3,
+# rec epoch 10 bs64, conv epoch 5 bs32; rtx6000/ = rec bs256, conv bs64) so differences come from the toggled component
+# only. Fusion: fusion_mode rows7 (v2.2). Keep in sync with ../../redial.yaml (= A9).
 # [rtx6000 profile] identical to base ablation/A9b1.yaml except batch_size x2 (16GB GPU: V100/P100)
 # dataset
 dataset: HReDial
@@ -43,12 +46,12 @@ collective_path: null    # null -> data/collective/<dataset>/
 # optim
 rec:
   epoch: 10
-  batch_size: 128
+  batch_size: 256
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
-  impatience: 3
+  impatience: 4
   optimizer:
-    name: Adam
+    name: AdamW
     lr: !!float 5e-4
   lr_scheduler:
     name: ReduceLROnPlateau
@@ -56,14 +59,14 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 4
-  batch_size: 256
-  impatience: 1
+  epoch: 5
+  batch_size: 64
+  # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
   optimizer:
-    name: Adam
+    name: AdamW
     lr: !!float 1e-3
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 3
+    patience: 1
     factor: 0.5
   gradient_clip: 0.1

@@ -47,7 +47,7 @@ rec:
   batch_size: 64
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
-  impatience: 3
+  impatience: 4
   optimizer:
     name: AdamW
     lr: !!float 5e-4
@@ -57,14 +57,14 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 4
+  epoch: 5
   batch_size: 32
-  impatience: 1
+  # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
   optimizer:
     name: AdamW
     lr: !!float 1e-3
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 3
+    patience: 1
     factor: 0.5
   gradient_clip: 0.1

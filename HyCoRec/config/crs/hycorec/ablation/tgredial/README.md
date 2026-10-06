@@ -32,7 +32,20 @@ ReDial-only v2.2 cells (`A9_v22*`) have no TG counterpart (no `*_unified_full` c
 
 ## Hyper-parameters (from `docs/statistic_findings.md`, `docs/tgredial_graph_review_findings.md`)
 
-Identical across all T* cells, so only the toggled component differs. (ReDial A-cells mix Adam/AdamW and batch sizes; TG does not.)
+Identical across all T* cells, so only the toggled component differs. (ReDial A-cells are now synced the same way: AdamW, rec 10 ep / conv 5 ep, see `../A*.yaml`.)
+
+### Why TG values differ from ReDial (same method, different data)
+
+| param | ReDial (`A*`) | HTGReDial (`T*`) | reason |
+|---|---|---|---|
+| `tokenize` | nltk | pkuseg | English vs Chinese corpus |
+| `rec` batch size | 64 (rtx6000: 128) | 128 (rtx6000: 128) | TG needs ~5 GiB before the first batch (word RGCN over the KG + A_hat), so rtx6000 is not x2 here; see Memory |
+| `khop_cap` | none | 300 | `entity_adj` hubs: TG max degree 20 647 (27 nodes > 1000) vs ReDial max 812 (15 nodes); TG p99 32 vs 4 |
+| `context_window_w` | 3 (sweep 1 in A2) | 3 (sweep 2/3/5: T9_w2, T9_w5) | ReDial item recurrence within 3 turns 88.6%, entity 75.2%; TG entity 83.9%, word 80.2%; TG item window is inert (3 re-mentions in 10k sessions) |
+| window effect | item + entity + word | entity + word only | TG targets are 100% cold, so C acts through entity/word |
+| review branch | RevCore reviews (decoded entity space) | Douban short comments, only ~26% of V_I (59% of mentions) | no native TG review corpus; the rest relies on scope G |
+| `fusion_mode`, `alpha`, lr, optimizer | rows7, AdamW 5e-4 / 1e-3 | same | kept identical so only the data differs |
+
 
 | param | value | evidence |
 |---|---|---|
@@ -40,8 +53,8 @@ Identical across all T* cells, so only the toggled component differs. (ReDial A-
 | `context_window_w` | 3 (sweep 2/5) | entity recurrence within 3 turns = 83.9% (5: 94.7%), word 80.2% (5: 92.5%); zero collapse for w<=5 (sessions 10-16 turns); decay cliff at g~9-10 so w>=10 is pointless |
 | item window | no separate setting | only 3 item re-mentions in 10k sessions and 100% of targets are cold: the C scope acts through entity/word, so T1/T2 measure that, not item recall |
 | `khop_cap` | 300 | `entity_adj` mean degree 8.4 (ReDial 2.4), max 20 647 (generic tags such as `影视作品`) |
-| `rec` | 10 epochs, bs 128, AdamW 5e-4, early stop on recall@50 | as T9 / ReDial |
-| `conv` | 4 epochs, bs 32, AdamW 1e-3 | as T9 / ReDial |
+| `rec` | 10 epochs, bs 128, AdamW 5e-4, early stop on recall@50 (impatience 4; lr halved after 2 non-improving epochs) | as T9 / ReDial |
+| `conv` | 5 epochs, bs 32, AdamW 1e-3, no early stop (last model tested), lr halved after 2 non-improving valid gen_loss epochs | as T9 / ReDial |
 | `fusion_mode` | rows7 | v2.2 Eq. 11-13 (final choice); alpha is unused, so no frozen-alpha (A10/T10) cells |
 | review | Douban index; ~26% of items, ~59% of item mentions | `docs/tgredial_review_corpus.md`; the rest relies on G |
 
@@ -59,4 +72,4 @@ Evidence: `log/20261004-011141` (seed 3535) and `log/20261004-013754` (seed 123)
 
 - Valid rec_loss rises from epoch 0 (10.1 -> 16.5) while train loss falls (9.9 -> 4.4): the model memorises 8k sessions. Valid recall@50 still improves until epoch 6 (0.0606), then plateaus, so early stop on recall@50 is correct and `epoch: 10, impatience: 3` is kept (stops after epoch 9). No lr/dropout change is made: nothing in the logs isolates them.
 - Test recall@50: T9 0.0615 vs T9_norev 0.0591. Valid n~3000 gives SE ~0.004 on recall@50, so this gap is noise. Differences below ~0.005 between T cells need both seeds (123, 3535) averaged before being read as an effect.
-- Cost per cell (solo): rec ~7 min/epoch x 10 + conv ~18 min/epoch x 4 = ~3 h; the full 13-cell ladder is ~39 h per seed. Cheapest cells to drop if time is short: T3b, T9_w2, T9_w5.
+- Cost per cell (solo): rec ~7 min/epoch x 10 + conv ~18 min/epoch x 5 = ~3.3 h; the full 13-cell ladder is ~43 h per seed. Cheapest cells to drop if time is short: T3b, T9_w2, T9_w5.

@@ -42,13 +42,13 @@ use_review_hypergraph: true   # H^{P,rev}_E (Eq. 1r/1s); needs build_review_inde
 review_index_path: null       # null -> data/reviews/<dataset>/review_index.json
 # optim
 rec:
-  epoch: 8
+  epoch: 10
   batch_size: 64
   early_stop: True
   stop_mode: max   # tracks recall@50 (see train_recommender), not rec_loss
-  impatience: 3
+  impatience: 4
   optimizer:
-    name: Adam
+    name: AdamW
     lr: !!float 5e-4
   lr_scheduler:
     name: ReduceLROnPlateau
@@ -56,14 +56,14 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 2
-  batch_size: 128
-  impatience: 1
+  epoch: 5
+  batch_size: 32
+  # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
   optimizer:
-    name: Adam
+    name: AdamW
     lr: !!float 1e-3
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 3
+    patience: 1
     factor: 0.5
   gradient_clip: 0.1

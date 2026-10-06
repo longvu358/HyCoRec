@@ -50,7 +50,7 @@ rec:
   batch_size: 128
   early_stop: true
   stop_mode: max
-  impatience: 3
+  impatience: 4
   optimizer:
     name: AdamW
     lr: 0.0005
@@ -60,14 +60,14 @@ rec:
     patience: 1
     factor: 0.5
 conv:
-  epoch: 4
+  epoch: 5
   batch_size: 32
-  impatience: 1
+  # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
   optimizer:
     name: AdamW
     lr: 0.001
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 3
+    patience: 1
     factor: 0.5
   gradient_clip: 0.1
