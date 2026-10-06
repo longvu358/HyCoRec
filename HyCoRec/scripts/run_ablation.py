@@ -13,7 +13,9 @@ Usage:
     uv run scripts/run_ablation.py run --cells A0 A1 A2 --seeds 3407 # subset
     uv run scripts/run_ablation.py summarize                        # rebuild tables only
     uv run scripts/run_ablation.py run --cells A9 A9_v22_sep --seeds 3407   # ReDial v2.1 vs v2.2-sep
-    uv run scripts/run_ablation.py run --cells T9 T9_norev --seeds 3407     # HTGReDial, review on/off
+    uv run scripts/run_ablation.py run --dataset tgredial --seeds 123 --gpu-profile rtx6000   # full HTGReDial ladder (T*)
+    uv run scripts/run_ablation.py run --dataset tgredial --cells T9 T9_norev --seeds 3407    # review on/off
+    uv run scripts/run_ablation.py summarize --dataset tgredial
 
 Two cells from the spec's table (docs/contexual_personal_collective/
 cpc_hypergraph_v2.1_method_spec.md §6.2) are BLOCKED and skipped by default:
@@ -47,22 +49,37 @@ ROOT = Path(__file__).resolve().parent.parent  # .../HyCoRec
 ABLATION_CFG_DIR = ROOT / "config" / "crs" / "hycorec" / "ablation"
 RUN_CFG_DIR = ROOT / "config" / "crs" / "hycorec" / "ablation" / "_runs"
 LOG_DIR = ROOT / "log"
-RESULTS_DIR = ROOT / "results" / "ablation"
+RESULTS_DIR = ROOT / "results" / "ablation"  # ReDial; other datasets: results/ablation_<dataset>/
+
+# Datasets: each has its own config subdir, cell ladder and results dir (so
+# summaries never mix datasets). "hredial" keeps the original layout.
+DATASETS = ("hredial", "tgredial")
+DATASET_CFG_DIRS = {"hredial": ABLATION_CFG_DIR, "tgredial": ABLATION_CFG_DIR / "tgredial"}
 
 # GPU profiles: same cell->filename ladder, resolved under a different config
 # subdir with a different batch_size per hardware (see --gpu-profile).
-GPU_PROFILES = {
-    "default": ABLATION_CFG_DIR,
-    "rtx6000": ABLATION_CFG_DIR / "rtx6000",  # 16GB cards (V100/P100): same configs as default, batch_size x2
+GPU_PROFILE_SUBDIRS = {
+    "default": "",
+    "rtx6000": "rtx6000",  # 16GB cards (V100/P100): same configs as default, batch_size x2
 }
+GPU_PROFILES = list(GPU_PROFILE_SUBDIRS)
+
+
+def cfg_dir_for(dataset: str, profile: str) -> Path:
+    base = DATASET_CFG_DIRS[dataset]
+    sub = GPU_PROFILE_SUBDIRS[profile]
+    return base / sub if sub else base
+
+
+def results_dir_for(dataset: str) -> Path:
+    return RESULTS_DIR if dataset == "hredial" else RESULTS_DIR.parent / f"ablation_{dataset}"
 
 # Full ladder: every config under ablation/ (and each GPU profile subdir) runs by default.
-#   A0-A10         spec ladder (A4/A11 excluded -- see BLOCKED)
-#   A3b/A9b1/A10b1 non-spec debug configs
-#   A9_rows7, A9_v22*  ReDial CPC v2.2 variants (need data/collective/hredial_unified_full)
-#   T9, T9_norev       HTGReDial full / review-off control (need data/collective/htgredial_full
-#                      and data/reviews/htgredial/review_index.json for T9)
-# Results of different datasets never mix: summaries are keyed by cell name.
+#   A0-A9          spec ladder (A4/A11 excluded -- see BLOCKED)
+#   A3b/A9b1       non-spec debug configs
+#   A9_v22*        ReDial CPC v2.2 variants (need data/collective/hredial_unified_full)
+# HTGReDial cells live in TG_LADDER (config/.../ablation/tgredial/, see its README.md).
+# Results of different datasets never mix: each dataset has its own results dir.
 LADDER = {
     "A0": "A0.yaml",
     "A1": "A1.yaml",
@@ -75,15 +92,16 @@ LADDER = {
     "A8": "A8.yaml",
     "A9": "A9.yaml",
     "A9b1": "A9b1.yaml",
-    "A10": "A10.yaml",
-    "A10b1": "A10b1.yaml",
-    "A9_rows7": "A9_rows7.yaml",
     "A9_v22": "A9_v22.yaml",
     "A9_v22_noword": "A9_v22_noword.yaml",
     "A9_v22_sep": "A9_v22_sep.yaml",
-    "T9": "T9.yaml",
-    "T9_norev": "T9_norev.yaml",
 }
+# HTGReDial ladder (mirrors the ReDial A-ladder; T = TG-ReDial).
+TG_LADDER = {c: f"{c}.yaml" for c in [
+    "T0", "T1", "T2", "T3", "T3b", "T5", "T6", "T7", "T8",
+    "T9", "T9_norev", "T9_w2", "T9_w5",
+]}
+LADDERS = {"hredial": LADDER, "tgredial": TG_LADDER}
 BLOCKED = {
     "A4": "needs the old MHIM retrieval-extension (extension_strategy is dead code)",
     "A11": "needs HyCoRec's review Transformer P_r (never implemented in this codebase)",
@@ -276,10 +294,11 @@ def already_done(results_path: Path, cell: str, seed: int, profile: str = "defau
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    ladder = LADDERS[args.dataset]
     cells = {}
-    for name in args.cells or list(LADDER):
-        if name in LADDER:
-            cells[name] = LADDER[name]
+    for name in args.cells or list(ladder):
+        if name in ladder:
+            cells[name] = ladder[name]
         elif name in BLOCKED:
             print(f"!! skipping {name}: BLOCKED ({BLOCKED[name]})")
         else:
@@ -288,15 +307,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.gpu_profile not in GPU_PROFILES:
         print(f"!! unknown --gpu-profile {args.gpu_profile!r}, choices: {list(GPU_PROFILES)}")
         sys.exit(1)
-    cfg_dir = GPU_PROFILES[args.gpu_profile]
+    cfg_dir = cfg_dir_for(args.dataset, args.gpu_profile)
 
     missing = {c: f for c, f in cells.items() if not (cfg_dir / f).is_file()}
     for c, f in missing.items():
         print(f"!! skipping {c}: {cfg_dir.relative_to(ROOT) / f} does not exist for --gpu-profile {args.gpu_profile}")
     cells = {c: f for c, f in cells.items() if c not in missing}
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    results_path = RESULTS_DIR / "results.jsonl"
+    results_dir = results_dir_for(args.dataset)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / "results.jsonl"
     stamp = new_stamp()
     print(f"Logs: log/{stamp}/")
 
@@ -316,8 +336,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             print(f"Stopping: {cell} seed={seed} failed and --stop-on-error was set.")
             sys.exit(1)
 
-    build_summary(results_path)
-    build_val_summary(results_path)
+    build_summary(results_path, dataset=args.dataset)
+    build_val_summary(results_path, dataset=args.dataset)
 
 
 def mean_std(vals: list[float]) -> str:
@@ -329,7 +349,7 @@ def mean_std(vals: list[float]) -> str:
     return f"{statistics.mean(vals):.4f}±{statistics.pstdev(vals):.4f}"
 
 
-def build_summary(results_path: Path, profile_filter: str | None = None) -> None:
+def build_summary(results_path: Path, profile_filter: str | None = None, dataset: str = "hredial") -> None:
     if not results_path.exists():
         print("No results yet.")
         return
@@ -349,7 +369,7 @@ def build_summary(results_path: Path, profile_filter: str | None = None) -> None
             continue
         by_cell.setdefault(label(r), []).append(r)
 
-    order = list(LADDER)
+    order = list(LADDERS[dataset])
     cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
 
     rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
@@ -375,7 +395,7 @@ def build_summary(results_path: Path, profile_filter: str | None = None) -> None
     for r in failed:
         fail_lines.append(f"| {label(r)} | {r['seed']} | {r['error']} |")
 
-    out = RESULTS_DIR / "summary.md"
+    out = results_dir_for(dataset) / "summary.md"
     out.write_text(
         "# Ablation results (spec 6.2)\n\n"
         f"Blocked cells (not runnable in current codebase): "
@@ -388,7 +408,7 @@ def build_summary(results_path: Path, profile_filter: str | None = None) -> None
     print(f"Wrote {out.relative_to(ROOT)} ({len(rows)} total runs, {len(failed)} failed)")
 
 
-def build_val_summary(results_path: Path, profile_filter: str | None = None) -> None:
+def build_val_summary(results_path: Path, profile_filter: str | None = None, dataset: str = "hredial") -> None:
     """Same tables as build_summary but sourced from the best-checkpoint valid
     reports (the [Valid] block right before the model is restored for [Test]),
     re-parsed from each run's log file -- results.jsonl predates rec_valid/
@@ -414,7 +434,7 @@ def build_val_summary(results_path: Path, profile_filter: str | None = None) -> 
         r = {**r, "rec_valid": reparsed["rec_valid"], "conv_valid": reparsed["conv_valid"]}
         by_cell.setdefault(label(r), []).append(r)
 
-    order = list(LADDER)
+    order = list(LADDERS[dataset])
     cells_present = [c for c in order if c in by_cell] + [c for c in by_cell if c not in order]
 
     rec_lines = ["| cell | n | " + " | ".join(REC_METRIC_KEYS) + " |",
@@ -429,7 +449,7 @@ def build_val_summary(results_path: Path, profile_filter: str | None = None) -> 
         rec_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(rec_vals[k]) for k in REC_METRIC_KEYS) + " |")
         conv_lines.append(f"| {cell} | {len(runs)} | " + " | ".join(mean_std(conv_vals[k]) for k in CONV_METRIC_KEYS) + " |")
 
-    out = RESULTS_DIR / "summary_val.md"
+    out = results_dir_for(dataset) / "summary_val.md"
     out.write_text(
         "# Ablation results (spec 6.2) -- validation split\n\n"
         "Same cells/runs as summary.md, but every metric is the best-checkpoint "
@@ -444,14 +464,15 @@ def build_val_summary(results_path: Path, profile_filter: str | None = None) -> 
 
 
 def cmd_summarize(args: argparse.Namespace) -> None:
-    build_summary(RESULTS_DIR / "results.jsonl", profile_filter=args.gpu_profile)
-    build_val_summary(RESULTS_DIR / "results.jsonl", profile_filter=args.gpu_profile)
+    results_path = results_dir_for(args.dataset) / "results.jsonl"
+    build_summary(results_path, profile_filter=args.gpu_profile, dataset=args.dataset)
+    build_val_summary(results_path, profile_filter=args.gpu_profile, dataset=args.dataset)
 
 
 def cmd_smoke(args: argparse.Namespace) -> None:
     """Fast harness check: trains on the (small) valid split via run_crslab.py -d.
     Does NOT write to results.jsonl / summary.md -- just proves the plumbing works."""
-    cfg_file = LADDER.get(args.cell)
+    cfg_file = LADDERS[args.dataset].get(args.cell)
     if not cfg_file:
         print(f"unknown cell {args.cell!r}")
         sys.exit(1)
@@ -460,7 +481,7 @@ def cmd_smoke(args: argparse.Namespace) -> None:
         sys.exit(1)
     result = run_one(
         args.cell, cfg_file, args.seed, args.gpu, args.timeout_hours,
-        debug=True, cfg_dir=GPU_PROFILES[args.gpu_profile], profile=args.gpu_profile, ddp=args.ddp,
+        debug=True, cfg_dir=cfg_dir_for(args.dataset, args.gpu_profile), profile=args.gpu_profile, ddp=args.ddp,
     )
     print(json.dumps(result, indent=2))
 
@@ -469,30 +490,36 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
 
+    def add_dataset(sp):
+        sp.add_argument("--dataset", default="hredial", choices=DATASETS, help="which ablation ladder/config dir/results dir to use")
+
     p_run = sub.add_parser("run", help="run (missing) ablation cells and rebuild the summary")
     p_run.add_argument("--cells", nargs="*", default=None, help="cell names, default = every cell in LADDER (all configs; A4/A11 stay blocked)")
     p_run.add_argument("--seeds", nargs="+", type=int, default=[3407], help="spec asks for x3 seeds")
     p_run.add_argument("--gpu", default="0", help="GPU id string for run_crslab.py -g (use -1 for CPU)")
     p_run.add_argument("--ddp", action="store_true", help="with several --gpu ids, launch via torchrun (one process per GPU, DistributedDataParallel) instead of DataParallel")
-    p_run.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES),
+    p_run.add_argument("--gpu-profile", default="default", choices=GPU_PROFILES,
                         help="config subdir to run from; 'rtx6000' = same ladder, batch_size x2 for 16GB GPUs")
     p_run.add_argument("--timeout-hours", type=float, default=None, help="kill a single run after N hours")
     p_run.add_argument("--force", action="store_true", help="rerun cells/seeds that already have a successful result")
     p_run.add_argument("--stop-on-error", action="store_true")
+    add_dataset(p_run)
     p_run.set_defaults(func=cmd_run)
 
     p_sum = sub.add_parser("summarize", help="rebuild results/ablation/summary.md from results.jsonl without training")
-    p_sum.add_argument("--gpu-profile", default=None, choices=list(GPU_PROFILES),
+    p_sum.add_argument("--gpu-profile", default=None, choices=GPU_PROFILES,
                         help="only summarize runs from this profile (default: all profiles)")
+    add_dataset(p_sum)
     p_sum.set_defaults(func=cmd_summarize)
 
-    p_smoke = sub.add_parser("smoke", help="fast harness check on the valid split (run_crslab.py -d); does not touch results.jsonl")
+    p_smoke = sub.add_parser("smoke", help="fast harness check on the valid split (run_crslab.py -d); does not touch results.jsonl") 
     p_smoke.add_argument("--cell", default="A0")
     p_smoke.add_argument("--seed", type=int, default=3407)
     p_smoke.add_argument("--gpu", default="0")
     p_smoke.add_argument("--ddp", action="store_true", help="launch via torchrun, one process per GPU")
-    p_smoke.add_argument("--gpu-profile", default="default", choices=list(GPU_PROFILES))
+    p_smoke.add_argument("--gpu-profile", default="default", choices=GPU_PROFILES)
     p_smoke.add_argument("--timeout-hours", type=float, default=1.0)
+    add_dataset(p_smoke)
     p_smoke.set_defaults(func=cmd_smoke)
 
     args = p.parse_args()

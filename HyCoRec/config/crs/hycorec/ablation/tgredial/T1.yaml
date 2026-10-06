@@ -1,0 +1,73 @@
+# Ablation T1 (HTGReDial) -- P + C, sliding window w=3 (Eq. 2)
+# HTGReDial (TG-ReDial) ablation ladder -- mirrors the ReDial A-ladder (spec 6.2), see ./README.md
+# Shared TG hyper-parameters (identical across ALL T* cells so differences come from the toggled component only):
+#   tokenize pkuseg | khop_cap 300 (entity_adj hub 20.6k) | w=3 | AdamW lr 5e-4 (rec) / 1e-3 (conv) | rec epoch 10 bs128 | conv epoch 4 bs32
+dataset: HTGReDial
+tokenize: pkuseg
+related_truncate: 1024
+context_truncate: 256
+response_truncate: 30
+scale: 1
+model: HyCoRec
+token_emb_dim: 300
+kg_emb_dim: 128
+num_bases: 8
+n_heads: 2
+n_layers: 2
+ffn_size: 300
+dropout: 0.1
+attention_dropout: 0.0
+relu_dropout: 0.1
+learn_positional_embeddings: false
+embeddings_scale: true
+reduction: false
+n_positions: 1024
+user_proj_dim: 512
+mha_n_heads: 4
+pooling: Mean
+extension_strategy: Adaptive
+scopes:
+- C
+- P
+k_hist: 40
+k_hop: 1
+khop_cap: 300
+context_window_w: 3
+hconv_layers: 2
+fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)
+scope_weights: separate
+alpha_init:
+- -1
+- 0
+- -1
+ei_mode: base
+freeze_alpha: false
+collective_path: null
+use_review_hypergraph: false
+review_index_path: null
+rec:
+  epoch: 10
+  batch_size: 128
+  early_stop: true
+  stop_mode: max
+  impatience: 3
+  optimizer:
+    name: AdamW
+    lr: 0.0005
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    mode: max
+    patience: 1
+    factor: 0.5
+conv:
+  epoch: 4
+  batch_size: 32
+  impatience: 1
+  optimizer:
+    name: AdamW
+    lr: 0.001
+  lr_scheduler:
+    name: ReduceLROnPlateau
+    patience: 3
+    factor: 0.5
+  gradient_clip: 0.1
