@@ -406,7 +406,7 @@ class HyCoRecModel(BaseModel):
         # fusion_mode: "field" = v2.1 per-field softmax alpha over (C,P,G) then
         # attention on 3 rows; "rows7" = v2.2 Eq. 11-13 (MHA(P_c, R, R) over the
         # up-to-7 pooled scope rows, empty rows dropped from the key set).
-        self.fusion_mode = opt.get("fusion_mode", "field")
+        self.fusion_mode = opt.get("fusion_mode", "rows7")
         self.word_rgcn = opt.get("word_rgcn", True)
         assert self.fusion_mode in ("field", "rows7")
         self.ei_mode = opt.get("ei_mode", "xg")  # base | xg  (Eq. 14a / 14b)
