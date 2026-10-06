@@ -46,6 +46,9 @@ class StandardEvaluator(BaseEvaluator):
         # with corpus size, e.g. it showed dist@4 > 2 in practice) and isn't
         # Distinct-n at all.
         self.dist_ngram_cnt = defaultdict(int)
+        # MHIM / HyCoRec paper definition: # distinct n-grams / # responses
+        # (unbounded; reported as dist_cnt@n for comparison with the papers).
+        self.dist_resp_cnt = 0
         self.gen_metrics = Metrics()
         # optim
         self.optim_metrics = Metrics()
@@ -68,6 +71,7 @@ class StandardEvaluator(BaseEvaluator):
         if hyp:
             self.gen_metrics.add("f1", F1Metric.compute(hyp, refs))
 
+            self.dist_resp_cnt += 1
             for k in range(1, 5):
                 self.gen_metrics.add(f"bleu@{k}", BleuMetric.compute(hyp, refs, k))
                 grams = list(ngrams(seq, k)) if seq else []
@@ -78,6 +82,10 @@ class StandardEvaluator(BaseEvaluator):
         for k, v in self.dist_set.items():
             total = self.dist_ngram_cnt[k]
             self.gen_metrics.add(k, AverageMetric(len(v), total if total > 0 else 1))
+            self.gen_metrics.add(
+                k.replace("dist@", "dist_cnt@"),
+                AverageMetric(len(v), max(self.dist_resp_cnt, 1)),
+            )
         reports = [self.rec_metrics.report(), self.gen_metrics.report(), self.optim_metrics.report()]
         all_reports = aggregate_unnamed_reports(reports)
         self.result_data.append({
@@ -96,5 +104,6 @@ class StandardEvaluator(BaseEvaluator):
         self.gen_metrics.clear()
         self.dist_set.clear()
         self.dist_ngram_cnt.clear()
+        self.dist_resp_cnt = 0
         # optim
         self.optim_metrics.clear()

@@ -95,7 +95,7 @@ REC_METRIC_KEYS = [
     "ndcg@1", "ndcg@10", "ndcg@50",
     "tail_recall@1", "tail_recall@10", "tail_recall@50",
 ]
-CONV_METRIC_KEYS = ["bleu@1", "bleu@2", "bleu@3", "bleu@4", "dist@1", "dist@2", "dist@3", "dist@4", "f1"]
+CONV_METRIC_KEYS = ["bleu@1", "bleu@2", "bleu@3", "bleu@4", "dist@1", "dist@2", "dist@3", "dist@4", "dist_cnt@2", "dist_cnt@3", "dist_cnt@4", "f1"]
 
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 REPORT_RE = re.compile(r"\| (?:crslab\.evaluator\.standard:report|.*:report):\d+ - \s*$")
