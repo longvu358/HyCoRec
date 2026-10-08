@@ -480,12 +480,12 @@ class HyCoRecModel(BaseModel):
             DATA_PATH, "collective", self.dataset.lower()
         )
         if not os.path.isdir(path):
-            logger.warning(
+            # Fail loudly: silently dropping G made T6/T7 ablation cells
+            # byte-identical to the P-only floor T0.
+            raise FileNotFoundError(
                 f"[CPC] scope G requested but no collective dir at {path}; "
-                "run build_collective.py. Disabling scope G."
+                "run build_collective.py."
             )
-            self.scopes = [s for s in self.scopes if s != "G"]
-            return
         # v2.2: a single unified Â^G over V^G = V_E u V_W (A_hat_G.npz)
         self.g_unified = os.path.isfile(os.path.join(path, "A_hat_G.npz"))
         if self.g_unified:

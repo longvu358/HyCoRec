@@ -49,25 +49,29 @@ rec:
   epoch: 10
   batch_size: 128
   early_stop: true
-  stop_mode: max
-  impatience: 4
+  stop_mode: max   # tracks recall@50 (see train_recommender)
+  impatience: 2    # valid rec_loss diverges after ~epoch 2 (train 10->4, valid 10->16); stop early
   optimizer:
     name: AdamW
-    lr: 0.0005
+    lr: 0.0002
+    weight_decay: 0.01
   lr_scheduler:
     name: ReduceLROnPlateau
     mode: max
-    patience: 1
+    patience: 0
     factor: 0.5
 conv:
   epoch: 5
   batch_size: 32
-  # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
+  early_stop: true
+  stop_mode: min   # valid gen_loss; best epoch is restored before test (was: last epoch, valid gen_loss bottomed at epoch 1)
+  impatience: 2
   optimizer:
     name: AdamW
-    lr: 0.001
+    lr: 0.0005
+    weight_decay: 0.01
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 1
+    patience: 0
     factor: 0.5
   gradient_clip: 0.1

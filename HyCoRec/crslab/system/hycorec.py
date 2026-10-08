@@ -206,6 +206,9 @@ class HyCoRecSystem(BaseSystem):
             self.adjust_lr(metric)
             if self.early_stop(metric):
                 break
+        if self.need_early_stop:
+            distributed.barrier()  # rank 0 must have finished writing the checkpoint
+            self.restore_model()  # test the best-valid-gen_loss epoch, not the last
         # test
         logger.info('[Test]')
         if self.is_main:
