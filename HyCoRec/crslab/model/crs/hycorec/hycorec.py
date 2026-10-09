@@ -421,6 +421,7 @@ class HyCoRecModel(BaseModel):
         self.review_index = None
         self.pretrain = opt.get("pretrain", False)
         self.pretrain_data = None
+        self.pretrain_load = opt.get("pretrain_load", "all")  # "all" | "item"
         self.pretrain_epoch = opt.get("pretrain_epoch", 9999)
 
         super(HyCoRecModel, self).__init__(opt, device)
@@ -677,7 +678,13 @@ class HyCoRecModel(BaseModel):
             self.kg_emb_dim, self.kg_emb_dim, self.n_relation, num_bases=self.num_bases
         )
         if self.pretrain:
-            self.item_encoder.load_state_dict(self.pretrain_data["encoder"])
+            # MHIM has ONE kg_encoder serving every field; HyCoRec keeps three
+            # RGCNs, so load the (contrastively pretrained) weights into all of
+            # them by default. "item" = legacy behaviour (item_encoder only).
+            targets = {"all": (self.item_encoder, self.entity_encoder, self.word_encoder),
+                       "item": (self.item_encoder,)}[self.pretrain_load]
+            for enc in targets:
+                enc.load_state_dict(self.pretrain_data["encoder"])
         # hypergraph convolution. scope_weights="shared": ONE stack of L layers
         # per field reused by C/P/G (spec 3.1). "separate": every hypergraph owns
         # its stack -- C and P one per field (3 + 3), G one (unified) -- so

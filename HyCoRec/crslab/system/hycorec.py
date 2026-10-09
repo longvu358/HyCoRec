@@ -14,6 +14,7 @@ from crslab import distributed
 from crslab.config import DATA_PATH
 from crslab.evaluator.metrics.base import AverageMetric
 from crslab.evaluator.metrics.gen import PPLMetric
+from crslab.evaluator.metrics import RECMetric, NDCGMetric, MRRMetric
 from crslab.system.base import BaseSystem
 from crslab.system.utils.functions import ind2txt
 
@@ -70,9 +71,27 @@ class HyCoRecSystem(BaseSystem):
         with open(path, encoding="utf-8") as f:
             return set(json.load(f))
 
-    def rec_evaluate(self, rec_predict, item_label):
+    def rec_evaluate(self, rec_predict, item_label, seen_items=None):
         rec_predict = rec_predict.cpu()
         rec_predict = rec_predict[:, self.item_ids]
+        if seen_items is not None:
+            # Diagnostic: HTGReDial never recommends an item already mentioned in
+            # the session (0/2994 repeats), so also rank with those items masked.
+            # Reported as m{recall,ndcg,mrr}@k next to the standard (unmasked) ones.
+            if not hasattr(self, '_item_col'):
+                self._item_col = {v: i for i, v in enumerate(self.item_ids)}
+            masked = rec_predict.clone()
+            for row, seen in enumerate(seen_items):
+                cols = [self._item_col[i] for i in set(seen) if i in self._item_col]
+                if cols:
+                    masked[row, cols] = float('-inf')
+            _, m_ranks = torch.topk(masked, 50, dim=-1)
+            for m_rank, label in zip(m_ranks.tolist(), item_label.tolist()):
+                label = self._item_col[label]
+                for k in (1, 10, 50):
+                    self.evaluator.rec_metrics.add(f"mrecall@{k}", RECMetric.compute(m_rank, label, k))
+                    self.evaluator.rec_metrics.add(f"mndcg@{k}", NDCGMetric.compute(m_rank, label, k))
+                    self.evaluator.rec_metrics.add(f"mmrr@{k}", MRRMetric.compute(m_rank, label, k))
         _, rec_ranks = torch.topk(rec_predict, 50, dim=-1)
         rec_ranks = rec_ranks.tolist()
         item_label = item_label.tolist()
@@ -122,7 +141,7 @@ class HyCoRecSystem(BaseSystem):
             if mode == 'train':
                 self.backward(rec_loss)
             else:
-                self.rec_evaluate(rec_scores, batch['item'])
+                self.rec_evaluate(rec_scores, batch['item'], batch.get('readout_item'))
             rec_loss = rec_loss.item()
             self.evaluator.optim_metrics.add("rec_loss", AverageMetric(rec_loss))
         else:
@@ -219,7 +238,23 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.report(mode='test')
         distributed.barrier()
 
+    def eval_recommender(self, path):
+        """Load a full checkpoint and report rec metrics on valid and test."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f'[Rec-eval] restored {path}')
+        for name, loader in (('Valid', self.valid_dataloader), ('Test', self.test_dataloader)):
+            logger.info(f'[{name}]')
+            with torch.no_grad():
+                self.evaluator.reset_metrics()
+                for batch in loader.get_rec_data(self.rec_batch_size, shuffle=False):
+                    self.step(batch, stage='rec', mode='test')
+                self.evaluator.report(mode='test')
+
     def fit(self):
+        rec_eval_from = self.opt.get('rec_eval_from')
+        if rec_eval_from:
+            return self.eval_recommender(rec_eval_from)
         self.train_recommender()
         self.train_conversation()
 

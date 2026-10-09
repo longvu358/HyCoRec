@@ -36,8 +36,12 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--seed', type=int, default=2020)
     parser.add_argument('-p', '--pretrain', action='store_true', help='use pretrain weights')
     parser.add_argument('-e', '--pretrain_epoch', type=int, default=9999, help='pretrain epoch')
+    parser.add_argument('--rec_eval_from', type=str, default=None,
+                        help='no training: load this checkpoint and only run rec evaluation (valid+test, incl. seen-item-masked m* metrics)')
     args, _ = parser.parse_known_args()
     config = Config(args.config, args.gpu, args.debug, args.seed, args.pretrain, args.pretrain_epoch)
+    if args.rec_eval_from:
+        config['rec_eval_from'] = args.rec_eval_from
 
     from crslab.quick_start import run_crslab
 
