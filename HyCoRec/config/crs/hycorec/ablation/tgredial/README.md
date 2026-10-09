@@ -53,7 +53,7 @@ Identical across all T* cells, so only the toggled component differs. (ReDial A-
 | `context_window_w` | 3 (sweep 2/5) | entity recurrence within 3 turns = 83.9% (5: 94.7%), word 80.2% (5: 92.5%); zero collapse for w<=5 (sessions 10-16 turns); decay cliff at g~9-10 so w>=10 is pointless |
 | item window | no separate setting | only 3 item re-mentions in 10k sessions and 100% of targets are cold: the C scope acts through entity/word, so T1/T2 measure that, not item recall |
 | `khop_cap` | 300 | `entity_adj` mean degree 8.4 (ReDial 2.4), max 20 647 (generic tags such as `影视作品`) |
-| `rec` | 10 epochs, bs 128, AdamW lr 2e-4 wd 1e-2, early stop on recall@50 (impatience 2; lr halved after 1 non-improving epoch) | as T9 / ReDial |
+| `rec` | 10 epochs, bs 128, AdamW lr 2e-4 wd 1e-2, early stop on valid rec_loss (impatience 2; lr halved after 1 non-improving epoch) | as T9 / ReDial |
 | `conv` | 5 epochs, bs 32, AdamW lr 5e-4 wd 1e-2, early stop on valid gen_loss (impatience 2), best epoch restored before test | as T9 / ReDial |
 | `fusion_mode` | rows7 | v2.2 Eq. 11-13 (final choice); alpha is unused, so no frozen-alpha (A10/T10) cells |
 | review | Douban index; ~26% of items, ~59% of item mentions | `docs/tgredial_review_corpus.md`; the rest relies on G |

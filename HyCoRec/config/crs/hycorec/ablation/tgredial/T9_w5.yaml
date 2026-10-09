@@ -50,7 +50,8 @@ rec:
   epoch: 10
   batch_size: 128
   early_stop: true
-  stop_mode: max   # tracks recall@50 (see train_recommender)
+  stop_mode: min   # valid rec_loss (MHIM-style); lr scheduler follows the same metric
+  stop_metric: rec_loss
   impatience: 2    # valid rec_loss diverges after ~epoch 2 (train 10->4, valid 10->16); stop early
   optimizer:
     name: AdamW
@@ -58,7 +59,7 @@ rec:
     weight_decay: 0.01
   lr_scheduler:
     name: ReduceLROnPlateau
-    mode: max
+    mode: min
     patience: 0
     factor: 0.5
 conv:

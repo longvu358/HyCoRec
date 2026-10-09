@@ -177,7 +177,10 @@ class HyCoRecSystem(BaseSystem):
                     for batch in self.valid_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
                         self.step(batch, stage='rec', mode='valid')
                     self.evaluator.report(epoch=epoch, mode='valid')
-                    metric = self.evaluator.rec_metrics['recall@50']
+                    if self.rec_optim_opt.get('stop_metric', 'recall@50') == 'rec_loss':
+                        metric = self.evaluator.optim_metrics['rec_loss']
+                    else:
+                        metric = self.evaluator.rec_metrics['recall@50']
             metric = distributed.broadcast(metric)
             self.adjust_lr(metric)
             if self.early_stop(metric):
