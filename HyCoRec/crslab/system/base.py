@@ -13,6 +13,7 @@
 # @Email  : oran_official@outlook.com
 
 import os
+import time
 from abc import ABC, abstractmethod
 import numpy as np
 import random
@@ -97,7 +98,14 @@ class BaseSystem(ABC):
             if 'policy_model' in opt:
                 self.policy_model = get_model(opt, opt['policy_model'], self.device, vocab['policy'],
                                               side_data['policy']).to(self.device)
-        model_file_name = opt.get('model_file', f'{opt["model_name"]}.pth')
+        if 'model_file' in opt:
+            model_file_name = opt['model_file']
+        elif restore_system:
+            model_file_name = f'{opt["model_name"]}.pth'
+        else:
+            # per-run checkpoint so concurrent runs of the same model don't overwrite each other
+            stamp = distributed.broadcast(time.strftime('%Y%m%d-%H%M%S'))
+            model_file_name = f'{opt["model_name"]}_{opt["dataset"]}_{stamp}.pth'
         self.model_file = os.path.join(SAVE_PATH, model_file_name)
         if restore_system:
             self.restore_model()
