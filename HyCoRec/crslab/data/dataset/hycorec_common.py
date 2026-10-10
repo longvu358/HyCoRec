@@ -16,6 +16,7 @@ data contract (``docs/contexual_personal_collective/cpc_hypergraph_v2_method_spe
 Every rec/conv sample therefore carries:
 
 * ``tokens`` / ``response``                       -- unchanged, token ids
+* ``related_tokens``                              -- text of all previous sessions (Enc_H input, as MHIM)
 * ``item`` / ``entity`` / ``word``                -- per-turn lists (turn-local), history < current turn
 * ``item_global`` / ``entity_global`` / ``word_global`` -- flat V_f(d<=t) accumulators for readout
 * ``history_session_items`` / ``..._entities`` / ``..._words`` -- list of per-session node sets (scope P)
@@ -88,7 +89,26 @@ def build_history_sessions(history_turns, k_hist):
     return sessions
 
 
-def augment_target_session(target_turns, conv_id, user_id, history_sessions):
+def build_related_tokens(history_turns, tok2ind, max_len=1024):
+    """MHIM ``related_tokens``: ``<start>`` + every utterance of the user's
+    previous sessions joined by ``_split_`` + ``<end>``, left-truncated to
+    ``max_len`` (input of Enc_H). A user without history yields ``[start, end]``."""
+    start, end, split = tok2ind["__start__"], tok2ind["__end__"], tok2ind["_split_"]
+    tokens = [start]
+    for turns in history_turns:
+        for turn in turns:
+            tokens += turn["text"] + [split]
+    if tokens[-1] == split:
+        tokens.pop()
+    tokens.append(end)
+    if len(tokens) > max_len:
+        tokens = [start] + tokens[-(max_len - 1):]
+    return tokens
+
+
+def augment_target_session(
+    target_turns, conv_id, user_id, history_sessions, related_tokens=None
+):
     """Generate one sample per turn (after the first) of the target session.
 
     ``history_sessions`` is shared by reference across all samples of the same
@@ -118,6 +138,8 @@ def augment_target_session(target_turns, conv_id, user_id, history_sessions):
                     "role": turn["role"],
                     "tokens": copy(context_tokens),
                     "response": text_tokens,
+                    # Enc_H input: all previous sessions' text (shared ref, read-only)
+                    "related_tokens": related_tokens,
                     # scope C: genuine per-turn (turn-local) node lists, turns <= current
                     "item": copy(context_items),
                     "entity": copy(context_entities),
@@ -168,9 +190,12 @@ def process_grouped_raw_data(raw_data, tok2ind, entity2id, unk_idx, k_hist):
         target_turns = merged[-1]
         target_conv = group[-1]
         history_sessions = build_history_sessions(merged[:-1], k_hist)
+        related_tokens = build_related_tokens(merged[:-1], tok2ind)
         conv_id = int(target_conv["conv_id"])
         user_id = target_conv.get("user_id")
         augmented.extend(
-            augment_target_session(target_turns, conv_id, user_id, history_sessions)
+            augment_target_session(
+                target_turns, conv_id, user_id, history_sessions, related_tokens
+            )
         )
     return augmented

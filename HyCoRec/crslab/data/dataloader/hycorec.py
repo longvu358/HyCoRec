@@ -107,7 +107,9 @@ class HyCoRecDataLoader(BaseDataLoader):
         for conv_dict in batch:
             batch_related_tokens.append(
                 truncate(
-                    conv_dict["tokens"][-1], self.related_truncate, truncate_tail=False
+                    conv_dict["related_tokens"],
+                    self.related_truncate,
+                    truncate_tail=False,
                 )
             )
             batch_context_tokens.append(
