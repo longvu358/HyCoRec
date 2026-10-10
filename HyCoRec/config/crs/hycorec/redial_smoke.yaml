@@ -49,7 +49,7 @@ hconv_layers: 2
 fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)
 scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse
 alpha_init: [-1, 0, -1]
-ei_mode: xg              # base | xg
+ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
 freeze_alpha: false
 collective_path: data/collective/hredial_full   # G0 = hredial/ ; G full (rev+aspect) = hredial_full/
 use_review_hypergraph: true

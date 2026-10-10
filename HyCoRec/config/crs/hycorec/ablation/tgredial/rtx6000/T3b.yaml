@@ -1,4 +1,4 @@
-# Ablation T3b (HTGReDial) -- P + G0, ei=xg (Eq. 14b)
+# Ablation T3b (HTGReDial) -- P + G0 (ei_mode base)
 # [rtx6000 profile] SAME batch_size as base (rec 128 / conv 32), NOT x2 like the ReDial cells: two seeds run concurrently on the same 4x16GB GPUs
 # and HTGReDial's per-process footprint is ~2x ReDial's (T9 bs256 = 9.9GB/GPU), so two bs256 jobs OOM (log/20261004-013754 T9/T9_norev seed123).
 # Shared TG hyper-parameters: see ../README.md
@@ -40,7 +40,7 @@ alpha_init:
 - -1
 - 0
 - -1
-ei_mode: xg
+ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
 freeze_alpha: false
 collective_path: data/collective/htgredial
 use_review_hypergraph: false

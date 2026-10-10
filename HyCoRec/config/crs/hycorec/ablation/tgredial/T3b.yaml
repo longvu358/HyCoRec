@@ -1,4 +1,4 @@
-# Ablation T3b (HTGReDial) -- P + G0, ei=xg (Eq. 14b)
+# Ablation T3b (HTGReDial) -- P + G0 (ei_mode base)
 # HTGReDial (TG-ReDial) ablation ladder -- mirrors the ReDial A-ladder (spec 6.2), see ./README.md
 # Shared TG hyper-parameters (identical across ALL T* cells so differences come from the toggled component only):
 #   tokenize pkuseg | khop_cap 300 (entity_adj hub 20.6k) | w=3 | AdamW lr 5e-4 (rec) / 1e-3 (conv) | rec epoch 10 bs128 | conv epoch 4 bs32
@@ -40,7 +40,7 @@ alpha_init:
 - -1
 - 0
 - -1
-ei_mode: xg
+ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
 freeze_alpha: false
 collective_path: data/collective/htgredial
 use_review_hypergraph: false

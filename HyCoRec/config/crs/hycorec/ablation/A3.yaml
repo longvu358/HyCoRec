@@ -1,4 +1,4 @@
-# Ablation A3 (ReDial, CPC-Hypergraph v2.2 rows7, spec 6.2) -- P + G0 (dialogue-only collective), (14a)
+# Ablation A3 (ReDial, CPC-Hypergraph v2.2 rows7, spec 6.2) -- P + G0 (dialogue-only collective)
 # ReDial ladder: shared hyper-parameters are identical across ALL A* cells (rec/conv: AdamW, lr 5e-4/1e-3,
 # rec epoch 10 bs64, conv epoch 5 bs32; rtx6000/ = rec bs256, conv bs64) so differences come from the toggled component
 # only. Fusion: fusion_mode rows7 (v2.2). Keep in sync with ../redial.yaml (= A9).

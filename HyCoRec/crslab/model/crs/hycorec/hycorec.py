@@ -409,7 +409,7 @@ class HyCoRecModel(BaseModel):
         self.fusion_mode = opt.get("fusion_mode", "rows7")
         self.word_rgcn = opt.get("word_rgcn", True)
         assert self.fusion_mode in ("field", "rows7")
-        self.ei_mode = opt.get("ei_mode", "xg")  # base | xg  (Eq. 14a / 14b)
+        self.ei_mode = opt.get("ei_mode", "base")  # base: E = X^(0)_E (Eq. 17) | xg: + X^G (legacy 14b)
         self.item_entity_ids = list(side_data.get("item_entity_ids", []))
         self.collective = None
         self.g_unified = False
