@@ -40,7 +40,7 @@ alpha_init:
 - -1
 - 0
 - -1
-ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
+ei_mode: xg
 freeze_alpha: false
 collective_path: data/collective/htgredial_review
 use_review_hypergraph: false

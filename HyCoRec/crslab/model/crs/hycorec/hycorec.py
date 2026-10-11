@@ -409,7 +409,7 @@ class HyCoRecModel(BaseModel):
         self.fusion_mode = opt.get("fusion_mode", "rows7")
         self.word_rgcn = opt.get("word_rgcn", True)
         assert self.fusion_mode in ("field", "rows7")
-        self.ei_mode = opt.get("ei_mode", "base")  # base: E = X^(0)_E (Eq. 17) | xg: + X^G (legacy 14b)
+        self.ei_mode = opt.get("ei_mode", "xg")  # xg: E = X^(0)_I + X^G[V_E] (Eq. 17) | base: E = X^(0)_I (no G term)
         self.item_entity_ids = list(side_data.get("item_entity_ids", []))
         self.collective = None
         self.g_unified = False
@@ -1066,14 +1066,14 @@ class HyCoRecModel(BaseModel):
         ]
         return torch.stack(user_repr_list, dim=0), xg_by_field
 
-    def _candidate_table(self, entity_embedding, xg_by_field):
-        """E_I for the recommendation head (Eq. 14a / 14b)."""
+    def _candidate_table(self, item_embedding, xg_by_field):
+        """E for the recommendation head (Eq. 17): ``X^(0)_I + X^G[V_E]``, both in
+        the item field (n_entity x d_h); the candidate rows are those of V_I."""
         if self.ei_mode != "xg" or xg_by_field is None or not self.item_entity_ids:
-            return entity_embedding
+            return item_embedding
         if self.g_unified:
-            return entity_embedding + xg_by_field["G"][: entity_embedding.size(0)]
-        xg_i = xg_by_field["item"]  # (n_entity, d) -- item field lives in entity space
-        return entity_embedding + xg_i
+            return item_embedding + xg_by_field["G"][: item_embedding.size(0)]
+        return item_embedding + xg_by_field["item"]  # item field lives in entity space
 
     def _word_table(self):
         """Word X^(0). ``word_rgcn: false`` skips the RGCN, which runs over the
@@ -1100,7 +1100,7 @@ class HyCoRecModel(BaseModel):
             batch, item_embedding, entity_embedding, token_embedding
         )
 
-        e_i = self._candidate_table(entity_embedding, xg_by_field)
+        e_i = self._candidate_table(item_embedding, xg_by_field)
         scores = F.linear(user_embedding, e_i, self.rec_bias.bias)
         loss = self.rec_loss(scores, item)
         return loss, scores

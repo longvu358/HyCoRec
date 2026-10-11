@@ -1,4 +1,4 @@
-# Ablation A7 (ReDial, CPC-Hypergraph v2.2 rows7, spec 6.2) -- P + G0 + h^asp (aspect-only collective)
+# Ablation A7 (ReDial, CPC-Hypergraph v2.2 rows7, spec 6.2) -- P + G0 + h^asp (aspect-only collective), (14b)
 # ReDial ladder: shared hyper-parameters are identical across ALL A* cells (rec/conv: AdamW, lr 5e-4/1e-3,
 # rec epoch 10 bs64, conv epoch 5 bs32; rtx6000/ = rec bs256, conv bs64) so differences come from the toggled component
 # only. Fusion: fusion_mode rows7 (v2.2). Keep in sync with ../../redial.yaml (= A9).
@@ -40,7 +40,7 @@ hconv_layers: 2
 fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)
 scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse
 alpha_init: [-1, 0, -1]
-ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
+ei_mode: xg
 freeze_alpha: false
 collective_path: data/collective/hredial_aspect
 use_review_hypergraph: false

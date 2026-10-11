@@ -34,7 +34,7 @@ k_hop: 1
 context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
 hconv_layers: 2
 alpha_init: [-1, 0, -1]
-ei_mode: base   # E = X^(0)_E only (Eq. 17): candidate side as in prior work, gain comes from u
+ei_mode: xg
 freeze_alpha: false
 fusion_mode: rows7
 scope_weights: separate
