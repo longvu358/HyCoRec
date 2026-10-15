@@ -9,7 +9,8 @@ Kept separate from the old ablation ladder (run_ablation.py): own configs
     python scripts/run_cpg.py plan --exp S1 S2                      # list runs, status, what is missing
     python scripts/run_cpg.py run --exp S1 --dataset htgredial --gpu 0
     python scripts/run_cpg.py run --cells full wo_C --seeds 3407    # explicit cells
-    python scripts/run_cpg.py run --prio 1 --gpu 0,1 --ddp          # everything ready with priority 1
+    python scripts/run_cpg.py run --prio 1 --gpu 0,1,2,3 --parallel # 4 runs at a time, one per GPU
+    python scripts/run_cpg.py run --exp RQ1 --gpu 0,1 --ddp         # ONE run split over 2 GPUs
     python scripts/run_cpg.py run --exp S3 --smoke --gpu 0          # 1% data, 1 epoch, nothing recorded: checks a cell starts
     python scripts/run_cpg.py analyze --cells full hycorec_repro    # test-set dump from the saved ckpt (S4/S6/S7/S11)
     python scripts/run_cpg.py report --exp S4 S6 S7 S11             # tables from the dumps
@@ -133,10 +134,14 @@ def cmd_plan(args):
 
 
 def run_one(ds: str, cell: str, seed: int, gpu: str, ddp: bool, stamp: str, timeout_h: float | None,
-            smoke: bool = False) -> dict:
+            smoke: bool = False, rec_bs: int | None = None, conv_bs: int | None = None) -> dict:
     spec = M.CELLS[cell]
     rid = f"cpg_{ds}_{cell}_seed{seed}"
     opt = gen_config(cell, ds)
+    if rec_bs:  # GPU-memory fit; batch_size is global (split across ranks under --ddp)
+        opt["rec"]["batch_size"] = rec_bs
+    if conv_bs:
+        opt["conv"]["batch_size"] = conv_bs
     if smoke:  # pipeline check only: 1% of the data, one epoch, never recorded
         opt["scale"] = 0.01
         opt["rec"].update(epoch=1, early_stop=False)
@@ -197,12 +202,32 @@ def cmd_run(args):
         RESULTS_DIR.mkdir(parents=True)
     stamp = ("smoke-" if args.smoke else "") + time.strftime("%Y%m%d-%H%M%S")
     print(f"Logs: log/{stamp}/")
-    for d, c, s in todo:
-        res = run_one(d, c, s, args.gpu, args.ddp, stamp, args.timeout_hours, smoke=args.smoke)
-        if args.smoke:
-            continue
-        with open(RESULTS, "a") as f:
-            f.write(json.dumps(res) + "\n")
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+
+    lock = threading.Lock()
+    gpus = Queue()
+    if args.parallel:  # one single-GPU job per listed GPU, jobs pulled from a shared queue
+        for g in args.gpu.split(","):
+            gpus.put(g)
+    else:
+        gpus.put(args.gpu)
+
+    def job(item):
+        d, c, s = item
+        g = gpus.get()
+        try:
+            res = run_one(d, c, s, g, args.ddp, stamp, args.timeout_hours, smoke=args.smoke,
+                          rec_bs=args.rec_bs, conv_bs=args.conv_bs)
+        finally:
+            gpus.put(g)
+        if not args.smoke:
+            with lock, open(RESULTS, "a") as f:
+                f.write(json.dumps(res) + "\n")
+
+    with ThreadPoolExecutor(max_workers=gpus.qsize()) as ex:
+        list(ex.map(job, todo))
 
 
 def cmd_summarize(args):
@@ -406,7 +431,7 @@ def main():
     for name, fn in (("plan", cmd_plan), ("run", cmd_run), ("summarize", cmd_summarize),
                      ("analyze", cmd_analyze), ("report", cmd_report)):
         p = sub.add_parser(name)
-        p.add_argument("--exp", nargs="*", help="scenario ids: S1 S2 S2-app S3 S8 S9")
+        p.add_argument("--exp", nargs="*", help="RQ1 RQ4 RQ5 extra-S2 extra-S3 extra-S4 extra-S8")
         p.add_argument("--cells", nargs="*")
         p.add_argument("--dataset", nargs="*", choices=list(M.DATASETS))
         p.add_argument("--seeds", nargs="*", type=int, default=None, help="default: per-cell (3 seeds; RQ5 one)")
@@ -416,7 +441,11 @@ def main():
         if name == "analyze":
             p.add_argument("--force", action="store_true")
         if name == "run":
-            p.add_argument("--ddp", action="store_true")
+            p.add_argument("--ddp", action="store_true", help="ONE run over all --gpu ids (torch.distributed)")
+            p.add_argument("--parallel", action="store_true",
+                           help="--gpu 0,1,2,3 = four independent single-GPU runs at a time (usual choice)")
+            p.add_argument("--rec-bs", type=int, help="override rec batch size (global)")
+            p.add_argument("--conv-bs", type=int, help="override conv batch size (global)")
             p.add_argument("--force", action="store_true")
             p.add_argument("--smoke", action="store_true", help="1%% data, 1 epoch, results not recorded")
             p.add_argument("--timeout-hours", type=float, default=None)

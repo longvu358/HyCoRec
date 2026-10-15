@@ -27,3 +27,9 @@ logs -> `log/<stamp>/cpg_*.log`, checkpoints -> `save/cpg_*`. Only RQ1 cells run
     python scripts/run_cpg.py summarize --exp RQ1 RQ4 RQ5
 
 Baselines other than `hycorec_repro` are copied from the original papers (no std), as in the doc.
+
+## Running on a GPU box
+    python scripts/run_cpg.py run --exp RQ1 --gpu 0,1,2,3 --parallel          # 4 independent single-GPU runs at a time
+    python scripts/run_cpg.py run --exp RQ1 --gpu 0,1 --ddp                   # one run split over 2 GPUs (batch_size is global)
+    python scripts/run_cpg.py run --exp RQ4 --gpu 0 --rec-bs 64 --conv-bs 16  # smaller batch if OOM (changes the result slightly: keep it fixed within an RQ)
+Resumable: finished (dataset, cell, seed) are skipped; `--force` reruns. Nohup it: `nohup python scripts/run_cpg.py run ... &`.
