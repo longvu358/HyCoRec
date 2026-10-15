@@ -234,6 +234,11 @@ def cmd_summarize(args):
     if not RESULTS.exists():
         sys.exit("no results yet")
     rows = [json.loads(l) for l in RESULTS.read_text().splitlines()]
+    for r in rows:  # runs flagged only because an older parser missed the report: re-read their log
+        if str(r.get("error", "")).startswith("run finished without") and r.get("log_path"):
+            r.update(RA.parse_log(ROOT / r["log_path"]))
+            if r["rec_test"] is not None and (r["rec_only"] or r["reached_conv_test"]):
+                r.pop("error")
     rows = [r for r in rows if not r.get("error") and (not args.exp or r["exp"] in args.exp)]
     groups: dict[tuple, list] = {}
     for r in rows:

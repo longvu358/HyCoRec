@@ -148,6 +148,25 @@ def build_run_config(cell: str, cfg_file: str, seed: int, log_name: str | None =
     return dst
 
 
+def _parse_table(rest: list[str]) -> dict | None:
+    """Parse a pandas-rendered report: header/value line pairs, wrapped columns end with a backslash."""
+    block = []
+    for ln in rest:
+        if TS_RE.match(ln) or not ln.strip():
+            break
+        block.append(ln.rstrip())
+    out = {}
+    for h, v in zip(block[0::2], block[1::2]):
+        names, vals = h.replace("\\", "").split(), v.replace("\\", "").split()
+        if len(names) != len(vals):
+            return None
+        try:
+            out.update({n: float(x) for n, x in zip(names, vals)})
+        except ValueError:
+            return None
+    return out or None
+
+
 def parse_log(log_path: Path) -> dict:
     """Extract final rec/conv test metrics + alpha_f table from a run's log file."""
     out = {
@@ -194,7 +213,7 @@ def parse_log(log_path: Path) -> dict:
             try:
                 data = json.loads(payload)
             except json.JSONDecodeError:
-                data = None
+                data = _parse_table(lines[i + 1:])  # pandas renders the report as a wrapped table
             if data is not None and stage and mode:
                 if stage == "rec" and mode == "valid":
                     last_rec_valid = data
