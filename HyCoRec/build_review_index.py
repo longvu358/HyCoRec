@@ -312,6 +312,8 @@ def main():
         "restrictive for a review hyperedge, so this defaults to 10, the "
         "middle of the spec's own {5,10,20} sweep, instead of literally 1.",
     )
+    ap.add_argument("--out_name", default="review_index.json",
+                    help="file name under data/reviews/<dataset>/ (S9 k_rev sweep writes review_index_krev<k>.json)")
     ap.add_argument("--pos_star", type=int, default=POS_STAR, help="htgredial: Star >= this is positive")
     ap.add_argument(
         "--idf",
@@ -372,11 +374,11 @@ def main():
 
     out_dir = os.path.join(DATA_PATH, "reviews", args.dataset)
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "review_index.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, args.out_name), "w", encoding="utf-8") as f:
         json.dump(e_top, f)
-    with open(os.path.join(out_dir, "review_index_stats.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, args.out_name.replace(".json", "_stats.json")), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
-    print(f"[done] -> {out_dir}/review_index.json")
+    print(f"[done] -> {out_dir}/{args.out_name}")
 
 
 if __name__ == "__main__":

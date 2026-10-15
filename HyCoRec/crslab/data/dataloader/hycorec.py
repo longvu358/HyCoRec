@@ -2,8 +2,14 @@
 # @Author  :   Chenzhan Shang
 # @email   :   czshang@outlook.com
 
+import json
+import os
+from collections import defaultdict
+
 import torch
 from tqdm import tqdm
+
+from crslab.config import DATASET_PATH
 
 from crslab.data.dataloader.base import BaseDataLoader
 from crslab.data.dataloader.utils import (
@@ -37,6 +43,41 @@ class HyCoRecDataLoader(BaseDataLoader):
         self.context_truncate = opt.get("context_truncate", None)
         self.response_truncate = opt.get("response_truncate", None)
         self.entity_truncate = opt.get("entity_truncate", None)
+        # S4 / ladder A4: MHIM retrieval-based hyperedge extension. Off by default.
+        self.mhim_extension = opt.get("mhim_extension", None)
+        if self.mhim_extension:
+            assert self.mhim_extension in ("Adaptive", "Random")
+            self._load_conv2items(opt)
+
+    def _load_conv2items(self, opt):
+        path = os.path.join(DATASET_PATH, opt["dataset"].lower(), opt["tokenize"], "conv2items.json")
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        self._conv_items = {int(c): items for c, items in raw.items()}
+        self._item2convs = defaultdict(set)
+        for c, items in self._conv_items.items():
+            for i in set(items):
+                self._item2convs[i].add(c)
+
+    def _extended_sessions(self, conv_id, context_items, n_related):
+        """MHIM ``_search_extended_items`` + the ``truncate`` rule of ``recommend``: the
+        item lists of the (up to 50) conversations whose overlap ratio with the current
+        context items is >= 0.05, best first, keeping ``max(2, n_related / 4)`` of them.
+        Other conversations' items only (the current one is excluded)."""
+        ctx = set(context_items)
+        if not ctx:
+            return []
+        overlap = defaultdict(int)
+        for i in ctx:
+            for c in self._item2convs.get(i, ()):
+                if c != conv_id:
+                    overlap[c] += 1
+        ranked = sorted(
+            ((n / len(self._conv_items[c]), c) for c, n in overlap.items()), reverse=True
+        )[:50]
+        ext = [self._conv_items[c] for r, c in ranked if r >= 0.05]
+        keep = min(max(2, n_related // 4), len(ext))
+        return ext[:keep]
 
     @staticmethod
     def _flatten(turns, dedup=True):
@@ -46,11 +87,15 @@ class HyCoRecDataLoader(BaseDataLoader):
     def _scope_fields(self, conv_dict):
         """Common per-sample scope payload (shared by rec and conv)."""
         history = conv_dict.get("history_session_items") or []
+        if self.mhim_extension:
+            history = history + self._extended_sessions(
+                conv_dict["conv_id"], self._flatten(conv_dict["item"]), len(history)
+            )
         return {
             "context_turn_item": conv_dict["item"],
             "context_turn_entity": conv_dict["entity"],
             "context_turn_word": conv_dict["word"],
-            "history_session_item": conv_dict.get("history_session_items") or [],
+            "history_session_item": history,
             "history_session_entity": conv_dict.get("history_session_entities") or [],
             "history_session_word": conv_dict.get("history_session_words") or [],
             "readout_item": conv_dict.get("item_global")

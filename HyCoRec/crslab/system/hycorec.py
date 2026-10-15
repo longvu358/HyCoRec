@@ -241,6 +241,22 @@ class HyCoRecSystem(BaseSystem):
                 self.evaluator.report(mode='test')
         distributed.barrier()
 
+    # conv-side modules re-initialised in conv-only mode so the old run's conv
+    # training does not leak in (the checkpoint is saved again during conv).
+    _CONV_PREFIXES = ('related_encoder.', 'context_encoder.', 'decoder.',
+                      'user_proj_', 'copy_proj_', 'entity_to_token.')
+
+    def _restore_rec_only(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        state = {k: v for k, v in checkpoint['model_state_dict'].items()
+                 if not k.removeprefix('module.').startswith(self._CONV_PREFIXES)}
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        logger.info(f'[Conv-only] restored {len(state)} rec-side tensors from {path}; '
+                    f'{len(missing)} conv-side tensors left at fresh init')
+        # never overwrite the rec checkpoint with conv-stage weights
+        base, ext = os.path.splitext(self.model_file)
+        self.model_file = f'{base}_convonly{ext}'
+
     def eval_recommender(self, path):
         """Load a full checkpoint and report rec metrics on valid and test."""
         checkpoint = torch.load(path, map_location=self.device)
@@ -254,11 +270,67 @@ class HyCoRecSystem(BaseSystem):
                     self.step(batch, stage='rec', mode='test')
                 self.evaluator.report(mode='test')
 
+    def dump_test_predictions(self, path):
+        """S4/S6/S7/S11 analysis: one JSON line per test sample (conv_id, #turns so far,
+        #history sessions, target, full rank among items, tail flag, attention share on the 7 rows)
+        after a header line with params and inference cost. Needs a loaded checkpoint."""
+        import json
+        import time
+        model = getattr(self.model, 'module', self.model)
+        model.record_attn, model.item_attn.keep_weights = True, True
+        model.attn_log = []
+        rows, n_seen, elapsed = [], 0, 0.0
+        self.model.eval()
+        with torch.no_grad():
+            for batch in self.test_dataloader.get_rec_data(self.rec_batch_size, shuffle=False):
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        batch[k] = v.to(self.device)
+                batch['_sample_idx'] = torch.arange(len(batch['conv_id']), device=self.device)
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                t0 = time.time()
+                _, scores = model.forward(batch, 'test', 'rec')
+                if self.device.type == 'cuda':
+                    torch.cuda.synchronize()
+                elapsed += time.time() - t0
+                scores = scores.cpu()[:, self.item_ids]
+                top = scores.topk(20, dim=-1).indices.tolist()
+                for b, label in enumerate(batch['item'].tolist()):
+                    col = self.item_ids.index(label)
+                    rank = int((scores[b] > scores[b, col]).sum()) + 1
+                    rows.append({
+                        'conv_id': batch['conv_id'][b],
+                        'n_turn': len(batch['context_turn_entity'][b]),
+                        'n_hist': len(batch['history_session_entity'][b]),
+                        'target': label, 'rank': rank, 'tail': label in self.tail_item_ids,
+                        'top20': [self.item_ids[j] for j in top[b]],
+                        'attn': model.attn_log[n_seen + b],
+                    })
+                n_seen += len(batch['conv_id'])
+        header = {'params_M': sum(p.numel() for p in model.parameters()) / 1e6,
+                  'infer_ms_per_sample': 1000 * elapsed / max(1, n_seen), 'n_samples': n_seen}
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(json.dumps(header) + '\n')
+            for r in rows:
+                f.write(json.dumps(r) + '\n')
+        logger.info(f'[Dump] {n_seen} test samples -> {path}')
+
     def fit(self):
         rec_eval_from = self.opt.get('rec_eval_from')
         if rec_eval_from:
-            return self.eval_recommender(rec_eval_from)
-        self.train_recommender()
+            self.eval_recommender(rec_eval_from)
+            if self.opt.get('dump_path'):
+                self.dump_test_predictions(self.opt['dump_path'])
+            return
+        conv_only_from = self.opt.get('conv_only_from')
+        if conv_only_from:
+            self._restore_rec_only(conv_only_from)
+        else:
+            self.train_recommender()
+        if self.opt.get('rec_only'):
+            return  # rec-side experiments (ablation / sensitivity) skip the conv stage
         self.train_conversation()
 
     def interact(self):

@@ -250,6 +250,12 @@ def main():
         default=None,
         help="path to review_index.json; default data/reviews/<dataset>/review_index.json",
     )
+    ap.add_argument(
+        "--no_dialogue",
+        action="store_true",
+        help="drop the dialogue hyperedges h_d (S2 'w/o dialogue hyperedges in G'); only review/aspect "
+        "hyperedges remain, so combine with --use_review. tail_items.json still uses the dialogue counts.",
+    )
     ap.add_argument("--m_min", type=int, default=3, help="aspect-centric Eq. 5: df(c) >= m_min")
     ap.add_argument("--k_asp", type=int, default=50, help="aspect-centric Eq. 5: Top-k_asp items per aspect")
     ap.add_argument(
@@ -297,6 +303,10 @@ def main():
     print(f"[{args.dataset}] {len(groups)} groups -> extracting dialogue hyperedges ...")
     edges, n_conv = _dialogue_hyperedges(groups, tok2ind, entity2id, unk_idx)
     n_dlg = {f: len(edges[f]) for f in edges}
+    dlg_item_edges = edges["item"][: n_dlg["item"]]  # tail stats always use real dialogue counts
+    if args.no_dialogue:
+        edges = {f: [] for f in edges}
+        n_dlg = {f: 0 for f in edges}
 
     with_review = args.with_review or args.use_review
     with_aspect = args.with_aspect or args.use_review
@@ -322,6 +332,9 @@ def main():
             )
 
     suffix = "_full" if (with_review and with_aspect) else "_review" if with_review else "_aspect" if with_aspect else ""
+    if args.no_dialogue:
+        assert with_review or with_aspect, "--no_dialogue leaves G empty without --with_review/--with_aspect/--use_review"
+        suffix += "_nodlg"
     out_dir = args.out_dir or os.path.join(DATA_PATH, "collective", args.dataset + suffix)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -330,6 +343,7 @@ def main():
         "tokenize": tokenize,
         "with_review": with_review,
         "with_aspect": with_aspect,
+        "no_dialogue": args.no_dialogue,
         "fields": {},
     }
     for field in ("item", "entity", "word"):
@@ -357,12 +371,12 @@ def main():
         )
 
     item_universe = side_data.get("item_entity_ids") or sorted(
-        {v for h in edges["item"][: n_dlg["item"]] for v in h}
+        {v for h in dlg_item_edges for v in h}
     )
     # deg_dlg is always computed from dialogue hyperedges only (checklist §4.1
     # step 7's Matthew-effect stat is specifically about the review signal
     # reaching items dialogue alone never touches).
-    tail_items, freq = _tail_items(edges["item"][: n_dlg["item"]], item_universe)
+    tail_items, freq = _tail_items(dlg_item_edges, item_universe)
     with open(os.path.join(out_dir, "tail_items.json"), "w", encoding="utf-8") as f:
         json.dump(tail_items, f)
     n_unseen = sum(1 for i in item_universe if freq.get(i, 0) == 0)

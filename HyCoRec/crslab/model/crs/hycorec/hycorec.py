@@ -399,6 +399,8 @@ class HyCoRecModel(BaseModel):
         # (spec 3.1, checkpoint-compatible); "separate" = each scope owns its own
         # stack (C: self.hconv, P: self.hconv_p, G: self.hconv_g).
         self.scope_weights = opt.get("scope_weights", "shared")
+        # MHIM keeps the shared token embedding (decoder input + output proj) trainable in conv
+        self.conv_freeze_token_emb = opt.get("conv_freeze_token_emb", True)
         assert self.scope_weights in ("shared", "separate")
         self.collective_path = opt.get("collective_path", None)
         self.alpha_init = tuple(opt.get("alpha_init", (-1.0, 0.0, -1.0)))
@@ -406,10 +408,26 @@ class HyCoRecModel(BaseModel):
         # fusion_mode: "field" = v2.1 per-field softmax alpha over (C,P,G) then
         # attention on 3 rows; "rows7" = v2.2 Eq. 11-13 (MHA(P_c, R, R) over the
         # up-to-7 pooled scope rows, empty rows dropped from the key set).
+        # S2/S8 variants of rows7 (all keep the 7-row layout): "mean7" = plain mean of the
+        # non-empty rows (no query attention); "global_alpha" = learned 7-vector softmax weights
+        # shared by every sample (no query attention either).
         self.fusion_mode = opt.get("fusion_mode", "rows7")
         self.word_rgcn = opt.get("word_rgcn", True)
-        assert self.fusion_mode in ("field", "rows7")
-        self.ei_mode = opt.get("ei_mode", "xg")  # xg: E = X^(0)_I + X^G[V_E] (Eq. 17) | base: E = X^(0)_I (no G term)
+        assert self.fusion_mode in ("field", "rows7", "mean7", "global_alpha")
+        self.fusion_keys = opt.get("fusion_keys", "pooled")  # S8 F3: "node" = every node is a key, no per-row pooling
+        self.scope_embed = opt.get("scope_embed", False)  # S8 A10: learned e_k added to row k
+        self.g_readout = opt.get("g_readout", "mean")  # S8 A13: "balanced" = mean of per-node-type means for r^G
+        assert self.fusion_keys in ("pooled", "node") and self.g_readout in ("mean", "balanced")
+        # xg: E = X^(0)_I + X^G[V_E] (Eq. 17) | base: E = X^(0)_I (no G term) | S3 controls:
+        # free (free table instead of G), xg_perm (X^G rows permuted), xg_detach (stop-grad on the candidate path)
+        self.ei_mode = opt.get("ei_mode", "xg")
+        assert self.ei_mode in ("xg", "base", "free", "xg_perm", "xg_detach")
+        self._cand_perm = None
+        # analysis hook (scripts/run_cpg.py analyze): per-sample share of the query attention on
+        # the 7 rows [C_I,C_E,C_W,P_I,P_E,P_W,G]; NaN when no attention ran (no query / mean fusion)
+        self.record_attn = False
+        self.attn_log = []
+        self._ids_buf = []
         self.item_entity_ids = list(side_data.get("item_entity_ids", []))
         self.collective = None
         self.g_unified = False
@@ -491,7 +509,7 @@ class HyCoRecModel(BaseModel):
         self.g_unified = os.path.isfile(os.path.join(path, "A_hat_G.npz"))
         if self.g_unified:
             assert (
-                self.fusion_mode == "rows7"
+                self.fusion_mode != "field"
             ), "unified Â^G (A_hat_G.npz) needs fusion_mode: rows7"
             self.collective = load_collective(path, fields=("G",)).to(self.device)
         else:
@@ -708,6 +726,14 @@ class HyCoRecModel(BaseModel):
         self.fusion = ScopeFusion(init=self.alpha_init, freeze=self.freeze_alpha)
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
+        if self.scope_embed:
+            self.scope_emb = nn.Embedding(7, self.kg_emb_dim)
+            nn.init.normal_(self.scope_emb.weight, std=self.kg_emb_dim**-0.5)
+        if self.fusion_mode == "global_alpha":
+            self.row_logits = nn.Parameter(torch.zeros(7))
+        if self.ei_mode == "free":
+            self.cand_free = nn.Embedding(self.n_entity, self.kg_emb_dim)
+            nn.init.normal_(self.cand_free.weight, std=self.kg_emb_dim**-0.5)
         # pooling
         if self.pooling == "Attn":
             self.kg_attn = SelfAttentionBatch(self.kg_emb_dim, self.kg_emb_dim)
@@ -804,7 +830,10 @@ class HyCoRecModel(BaseModel):
                 return self.kg_attn_his(related_embedding)
             assert self.pooling == "Mean"
             return torch.mean(related_embedding, dim=0)
-        attentive = self.item_attn(related_embedding, context_embedding)
+        if self.fusion_mode in ("mean7", "global_alpha"):
+            attentive = related_embedding  # no query attention (S2 w/o query attention, S8 F1/F2)
+        else:
+            attentive = self.item_attn(related_embedding, context_embedding)
         if self.pooling == "Attn":
             user_repr = self.kg_attn_his(attentive).unsqueeze(0)
             user_repr = torch.cat((context_embedding, user_repr), dim=0)
@@ -855,7 +884,7 @@ class HyCoRecModel(BaseModel):
         rows = [tot2sub[v] for v in dict.fromkeys(query_nodes) if v in tot2sub]
         if not rows:
             return self._empty_row(none_if_empty)
-        return x[rows].mean(dim=0)
+        return x[rows] if self.fusion_keys == "node" else x[rows].mean(dim=0)
 
     def _gather_dense(self, xg, query_nodes):
         rows = sorted({v for v in query_nodes if 0 <= v < xg.size(0)})
@@ -905,7 +934,7 @@ class HyCoRecModel(BaseModel):
         ``fusion_mode == "rows7"``: rows is (n_rows<=7, d) = non-empty pooled
         rows [r^C_I,r^C_E,r^C_W, r^P_I,r^P_E,r^P_W, r^G] (spec v2.2 Eq. 11).
         """
-        rows7 = self.fusion_mode == "rows7"
+        rows7 = self.fusion_mode != "field"
         bsz = len(batch["conv_id"])
         fused_all, ctx_all = [], []
         for b in range(bsz):
@@ -967,23 +996,56 @@ class HyCoRecModel(BaseModel):
             if rows7:
                 # r^G: unified Â^G (Eq. 9-10) if loaded, else the interim mean
                 # over Q^G gathered across the three per-field Â^G_f.
+                node_keys = self.fusion_keys == "node"
                 if self.g_unified and xg_by_field is not None:
                     # Eq. 9-10: Q^G over the unified index space, one mean
-                    g = self._gather_dense(xg_by_field["G"], g_ids)
-                    r_g = None if g is None else g.mean(0)
+                    xg = xg_by_field["G"]
+                    if self.g_readout == "balanced":
+                        n_e = field_x0["entity"].size(0)
+                        parts = [self._gather_dense(xg, [v for v in g_ids if (v < n_e) == is_ent])
+                                 for is_ent in (True, False)]
+                        parts = [g for g in parts if g is not None]
+                        r_g = torch.stack([g.mean(0) for g in parts]).mean(0) if parts else None
+                    else:
+                        g = self._gather_dense(xg, g_ids)
+                        r_g = None if g is None else (g if node_keys else g.mean(0))
+                elif g_parts:
+                    if self.g_readout == "balanced":  # mean of the per-field means
+                        r_g = torch.stack([g.mean(0) for g in g_parts]).mean(0)
+                    else:
+                        r_g = torch.cat(g_parts, 0)
+                        r_g = r_g if node_keys else r_g.mean(0)
                 else:
-                    r_g = torch.cat(g_parts, 0).mean(0) if g_parts else None
-                rows = [r for r in c_rows + p_rows + [r_g] if r is not None]
-                fused_all.append(
-                    torch.stack(rows, 0)
-                    if rows
-                    else torch.zeros(0, self.kg_emb_dim, device=self.device)
-                )
+                    r_g = None
+                fused_all.append(self._stack_rows(c_rows + p_rows + [r_g]))
             else:
                 fused_all.append(torch.stack(per_field, dim=0))
             ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
             ctx_all.append(field_x0["entity"][ctx_ids] if ctx_ids else None)
         return fused_all, ctx_all
+
+    def _stack_rows(self, rows7):
+        """Non-empty rows of [r^C_I,r^C_E,r^C_W, r^P_I,r^P_E,r^P_W, r^G] -> (n, d).
+        Rows are (d,) pooled vectors, or (n_i, d) node matrices when fusion_keys == "node".
+        Applies the S8 row-level variants (scope embedding e_k, global alpha weights)."""
+        mats, ids = [], []
+        for k, r in enumerate(rows7):
+            if r is not None:
+                r = r.view(-1, self.kg_emb_dim)
+                mats.append(r)
+                ids += [k] * r.size(0)
+        if self.record_attn:
+            self._ids_buf.append(ids)
+        if not mats:
+            return torch.zeros(0, self.kg_emb_dim, device=self.device)
+        rows = torch.cat(mats, 0)
+        ids = torch.tensor(ids, device=self.device)
+        if self.scope_embed:
+            rows = rows + self.scope_emb(ids)
+        if self.fusion_mode == "global_alpha":
+            # weights over the rows present; x n so the downstream mean is the weighted sum
+            rows = rows * (torch.softmax(self.row_logits[ids], 0) * ids.numel()).unsqueeze(1)
+        return rows
 
     def _field_x0(self, item_embedding, entity_embedding, token_embedding):
         return {
@@ -1058,22 +1120,47 @@ class HyCoRecModel(BaseModel):
         (Eq. 13, minus the review Transformer P_r which this codebase lacks)."""
         field_x0 = self._field_x0(item_embedding, entity_embedding, token_embedding)
         xg_by_field = self._collective_by_field(field_x0)
+        self._ids_buf = []
         fused_all, ctx_all = self._cpc_field_preferences(batch, field_x0, xg_by_field)
 
-        user_repr_list = [
-            self._user_from_rows(fused_all[i], ctx_all[i])
-            for i in range(len(fused_all))
-        ]
+        user_repr_list = []
+        for i in range(len(fused_all)):
+            user_repr_list.append(self._user_from_rows(fused_all[i], ctx_all[i]))
+            if self.record_attn:
+                self._log_attn(self._ids_buf[i], fused_all[i], ctx_all[i])
         return torch.stack(user_repr_list, dim=0), xg_by_field
+
+    def _log_attn(self, ids, rows, ctx):
+        share = [float("nan")] * 7
+        w = self.item_attn.last_weights
+        if (self.fusion_mode in ("rows7", "field") and rows.size(0) and ctx is not None
+                and w is not None and w.size(1) == len(ids)):
+            acc = [0.0] * 7
+            for k, v in zip(ids, w.mean(0).tolist()):
+                acc[k] += v
+            share = acc
+        self.attn_log.append(share)
+        self.item_attn.last_weights = None
 
     def _candidate_table(self, item_embedding, xg_by_field):
         """E for the recommendation head (Eq. 17): ``X^(0)_I + X^G[V_E]``, both in
         the item field (n_entity x d_h); the candidate rows are those of V_I."""
-        if self.ei_mode != "xg" or xg_by_field is None or not self.item_entity_ids:
+        if self.ei_mode == "base":
             return item_embedding
-        if self.g_unified:
-            return item_embedding + xg_by_field["G"][: item_embedding.size(0)]
-        return item_embedding + xg_by_field["item"]  # item field lives in entity space
+        if self.ei_mode == "free":  # S3 D_free: extra capacity, no G
+            return item_embedding + self.cand_free.weight
+        if xg_by_field is None or not self.item_entity_ids:
+            return item_embedding
+        n = item_embedding.size(0)
+        xg = xg_by_field["G"][:n] if self.g_unified else xg_by_field["item"]  # item field lives in entity space
+        if self.ei_mode == "xg_perm":  # S3 D_perm: same magnitude/statistics, wrong row
+            if self._cand_perm is None or self._cand_perm.numel() != xg.size(0):
+                g = torch.Generator().manual_seed(0)
+                self._cand_perm = torch.randperm(xg.size(0), generator=g).to(xg.device)
+            xg = xg[self._cand_perm]
+        elif self.ei_mode == "xg_detach":  # S3 D_det: no gradient into G through the candidate path
+            xg = xg.detach()
+        return item_embedding + xg
 
     def _word_table(self):
         """Word X^(0). ``word_rgcn: false`` skips the RGCN, which runs over the
@@ -1112,7 +1199,7 @@ class HyCoRecModel(BaseModel):
     def freeze_parameters(self):
         freeze_models = [
             self.entity_embedding,
-            self.token_embedding,
+            *([self.token_embedding] if self.conv_freeze_token_emb else []),
             self.item_encoder,
             self.entity_encoder,
             self.word_encoder,
@@ -1121,7 +1208,10 @@ class HyCoRecModel(BaseModel):
             self.fusion,
             self.item_attn,
             self.rec_bias,
+            *[getattr(self, n) for n in ("scope_emb", "cand_free") if hasattr(self, n)],
         ]
+        if hasattr(self, "row_logits"):
+            self.row_logits.requires_grad = False
         if self.pooling == "Attn":
             freeze_models.append(self.kg_attn)
             freeze_models.append(self.kg_attn_his)
