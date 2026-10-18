@@ -14,8 +14,8 @@ num_bases: 8
 n_heads: 2
 n_layers: 2
 ffn_size: 300
-dropout: 0.1
-attention_dropout: 0.0
+dropout: 0.3
+attention_dropout: 0.1
 relu_dropout: 0.1
 learn_positional_embeddings: false
 embeddings_scale: true
@@ -44,22 +44,24 @@ review_index_path: null       # null -> data/reviews/<dataset>/review_index.json
 # optim
 rec:
   epoch: 10
-  batch_size: 64
+  batch_size: 256
   early_stop: True
-  stop_mode: min   # valid rec_loss (MHIM-style); lr scheduler follows the same metric
-  stop_metric: rec_loss
-  impatience: 4
+  stop_mode: max   # valid rec_loss (MHIM-style); lr scheduler follows the same metric
+  stop_metric: recall@50
+  impatience: 3
   optimizer:
     name: AdamW
-    lr: !!float 5e-4
+    lr: !!float 1e-3
+    weight_decay: 0.05
+  gradient_clip: 0.1
   lr_scheduler:
     name: ReduceLROnPlateau
-    mode: min
+    mode: max
     patience: 1
     factor: 0.5
 conv:
   epoch: 5
-  batch_size: 32
+  batch_size: 64
   # no early_stop for conv: all epochs run, last model is tested (impatience would be unused)
   optimizer:
     name: AdamW

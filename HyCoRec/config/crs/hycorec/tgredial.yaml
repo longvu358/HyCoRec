@@ -18,8 +18,8 @@ num_bases: 8
 n_heads: 2
 n_layers: 2
 ffn_size: 300
-dropout: 0.1
-attention_dropout: 0.0
+dropout: 0.3
+attention_dropout: 0.1
 relu_dropout: 0.1
 learn_positional_embeddings: false
 embeddings_scale: true
@@ -51,16 +51,17 @@ rec:
   epoch: 10
   batch_size: 128
   early_stop: true
-  stop_mode: min   # valid rec_loss (MHIM-style); lr scheduler follows the same metric
-  stop_metric: rec_loss
-  impatience: 2    # valid rec_loss diverges after ~epoch 2 (train 10->4, valid 10->16); stop early
+  stop_mode: max   # valid rec_loss (MHIM-style); lr scheduler follows the same metric
+  stop_metric: recall@50
+  impatience: 3    # valid rec_loss diverges after ~epoch 2 (train 10->4, valid 10->16); stop early
   optimizer:
     name: AdamW
-    lr: 0.0002
-    weight_decay: 0.01
+    lr: !!float 1e-3
+    weight_decay: 0.05
+  gradient_clip: 0.1
   lr_scheduler:
     name: ReduceLROnPlateau
-    mode: min
+    mode: max
     patience: 0
     factor: 0.5
 conv:
@@ -68,11 +69,11 @@ conv:
   batch_size: 32
   early_stop: true
   stop_mode: min   # valid gen_loss; best epoch is restored before test (was: last epoch, valid gen_loss bottomed at epoch 1)
-  impatience: 2
+  impatience: 3
   optimizer:
     name: AdamW
-    lr: 0.0005
-    weight_decay: 0.01
+    lr: !!float 1e-3
+    weight_decay: 0.05
   lr_scheduler:
     name: ReduceLROnPlateau
     patience: 0
