@@ -35,6 +35,7 @@ scopes: [C, P, G]
 k_hist: 40
 k_hop: 1
 khop_cap: 300   # cap neighbors/hop for H^P_{E,W} (HTGReDial entity_adj has hub nodes up to ~20.6k degree)
+exclude_target: false   # keep a gold item that was legitimately observed earlier (prefix/history); true = old guard that drops it from C/P hyperedges using the future label
 context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention
 hconv_layers: 2
 fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)

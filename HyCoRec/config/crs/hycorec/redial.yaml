@@ -31,6 +31,7 @@ scopes: [C, P, G]
 k_hist: 40
 k_hop: 1
 context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
+exclude_target: false   # keep a gold item that was legitimately observed earlier (prefix/history); true = old guard that drops it from C/P hyperedges using the future label
 hconv_layers: 2
 fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)
 scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse

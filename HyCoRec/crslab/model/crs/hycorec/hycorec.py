@@ -394,6 +394,11 @@ class HyCoRecModel(BaseModel):
         self.context_window_w = (
             opt.get("context_window_w", opt.get("hyperedge_window_k", None)) or 3
         )
+        # Off by default: dropping the gold item from already-observed prefix/history
+        # hyperedges would use the future label to rewrite the input (a repeat item
+        # that was legitimately mentioned before t must stay). The prefix of turn t
+        # never contains turn t's own items, so no guard is needed for leakage.
+        self.exclude_target = bool(opt.get("exclude_target", False))
         self.hconv_layers = opt.get("hconv_layers", 2)
         # scope_weights: "shared" = one HConv stack per field reused by C, P and G
         # (spec 3.1, checkpoint-compatible); "separate" = each scope owns its own
@@ -938,7 +943,7 @@ class HyCoRecModel(BaseModel):
         bsz = len(batch["conv_id"])
         fused_all, ctx_all = [], []
         for b in range(bsz):
-            target = int(batch["item"][b]) if "item" in batch else None
+            target = int(batch["item"][b]) if self.exclude_target and "item" in batch else None
             has_history = bool(batch["has_history"][b])
             per_field = []
             c_rows, p_rows, g_parts, g_ids = [], [], [], []
