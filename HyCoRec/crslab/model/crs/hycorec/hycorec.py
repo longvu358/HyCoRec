@@ -400,6 +400,8 @@ class HyCoRecModel(BaseModel):
         # never contains turn t's own items, so no guard is needed for leakage.
         self.exclude_target = bool(opt.get("exclude_target", False))
         self.hconv_layers = opt.get("hconv_layers", 2)
+        # dropout on the input of every HConv layer (C/P/G scopes); 0 = off
+        self.hconv_dropout = opt.get("hconv_dropout", 0.0)
         # scope_weights: "shared" = one HConv stack per field reused by C, P and G
         # (spec 3.1, checkpoint-compatible); "separate" = each scope owns its own
         # stack (C: self.hconv, P: self.hconv_p, G: self.hconv_g).
@@ -877,6 +879,7 @@ class HyCoRecModel(BaseModel):
             device=self.device,
         )
         for layer in self._stack_for(scope, field):
+            x = F.dropout(x, p=self.hconv_dropout, training=self.training)
             x = layer(x, ei, num_edges=n_edges)
         return x, tot2sub
 
@@ -1067,9 +1070,11 @@ class HyCoRecModel(BaseModel):
             # entity-field HConv layers); separate: G's own stack. Word ids sit at offset n_entity.
             x0 = torch.cat([field_x0["entity"], field_x0["word"]], dim=0)
             stack = self._stack_for("G", "G" if self.scope_weights == "separate" else "entity")
-            return {"G": self.collective.run("G", x0, stack)}
+            return {"G": self.collective.run("G", x0, stack, self.hconv_dropout, self.training)}
         return {
-            f: self.collective.run(f, field_x0[f], self._stack_for("G", f))
+            f: self.collective.run(
+                f, field_x0[f], self._stack_for("G", f), self.hconv_dropout, self.training
+            )
             for f in self._FIELDS
         }
 

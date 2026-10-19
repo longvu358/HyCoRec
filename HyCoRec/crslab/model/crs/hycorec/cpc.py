@@ -21,6 +21,7 @@ import random
 import numpy as np
 import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 FIELDS = ("item", "entity", "word")
@@ -142,12 +143,13 @@ class CollectivePropagation:
             self._replicas[key] = a.to(device)
         return self._replicas[key]
 
-    def run(self, field, x0, hconv_layers):
+    def run(self, field, x0, hconv_layers, dropout=0.0, training=False):
         """``x0``: (n_f, d) initial embeddings. ``hconv_layers``: iterable of
         ``CustomHypergraphConv`` (their ``.lin`` weight + ``.bias`` are reused)."""
         x = x0
         a = self._on(field, x0.device)
         for layer in hconv_layers:
+            x = F.dropout(x, p=dropout, training=training)
             x = torch.sparse.mm(a, layer.lin(x))
             if layer.bias is not None:
                 x = x + layer.bias
