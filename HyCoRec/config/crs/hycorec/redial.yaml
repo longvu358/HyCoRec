@@ -33,6 +33,7 @@ k_hop: 1
 context_window_w: 3   # sliding-window size w (spec v2.1 Eq. 2); w=1 degenerates to per-turn co-mention (A2 baseline)
 exclude_target: false   # keep a gold item that was legitimately observed earlier (prefix/history); true = old guard that drops it from C/P hyperedges using the future label
 hconv_layers: 2
+hconv_dropout: 0.2   # dropout on the input of each HConv layer (C/P/G); 0 = off
 fusion_mode: rows7   # v2.2 Eq. 11-13: MHA(P_c, R, R) over pooled scope rows (final choice)
 scope_weights: separate   # each hypergraph (C/P per field, G) owns its own HConv stack; "shared" = spec 3.1 reuse
 alpha_init: [-1, 0, -1]
@@ -51,13 +52,13 @@ rec:
   impatience: 3
   optimizer:
     name: AdamW
-    lr: !!float 1e-3
-    weight_decay: 0.05
-  gradient_clip: 0.1
+    lr: !!float 5e-4
+    weight_decay: 0.1
+  gradient_clip: 1
   lr_scheduler:
     name: ReduceLROnPlateau
     mode: max
-    patience: 1
+    patience: 0
     factor: 0.5
 conv:
   epoch: 5
@@ -68,6 +69,6 @@ conv:
     lr: !!float 1e-3
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 1
+    patience: 0
     factor: 0.5
   gradient_clip: 0.1
