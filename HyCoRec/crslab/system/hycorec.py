@@ -279,6 +279,8 @@ class HyCoRecSystem(BaseSystem):
         model = getattr(self.model, 'module', self.model)
         model.record_attn, model.item_attn.keep_weights = True, True
         model.attn_log = []
+        model.ret_log = []
+        model.ret_alpha_lt005 = [0, 0]
         rows, n_seen, elapsed = [], 0, 0.0
         self.model.eval()
         with torch.no_grad():
@@ -306,10 +308,12 @@ class HyCoRecSystem(BaseSystem):
                         'target': label, 'rank': rank, 'tail': label in self.tail_item_ids,
                         'top20': [self.item_ids[j] for j in top[b]],
                         'attn': model.attn_log[n_seen + b],
+                        'retention': (model.ret_log[n_seen + b] if model.ret_log else None),
                     })
                 n_seen += len(batch['conv_id'])
         header = {'params_M': sum(p.numel() for p in model.parameters()) / 1e6,
-                  'infer_ms_per_sample': 1000 * elapsed / max(1, n_seen), 'n_samples': n_seen}
+                  'infer_ms_per_sample': 1000 * elapsed / max(1, n_seen), 'n_samples': n_seen,
+                  'alpha_lt005': model.ret_alpha_lt005[0] / max(1, model.ret_alpha_lt005[1])}
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         with open(path, 'w') as f:
             f.write(json.dumps(header) + '\n')

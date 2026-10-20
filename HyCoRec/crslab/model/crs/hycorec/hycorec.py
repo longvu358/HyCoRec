@@ -32,6 +32,7 @@ from crslab.config import DATA_PATH, DATASET_PATH
 from crslab.model.base import BaseModel
 from crslab.model.crs.hycorec.attention import MHItemAttention
 from crslab.model.crs.hycorec.cpc import (
+    RetentionGate,
     ScopeFusion,
     build_incidence,
     khop_closure,
@@ -125,6 +126,7 @@ class CustomHypergraphConv(MessagePassing):
         hyperedge_weight: Optional[Tensor] = None,
         hyperedge_attr: Optional[Tensor] = None,
         num_edges: Optional[int] = None,
+        edge_gate: Optional[Tensor] = None,
     ) -> Tensor:
         r"""Runs the forward pass of the module.
 
@@ -143,6 +145,11 @@ class CustomHypergraphConv(MessagePassing):
                 :obj:`use_attention=True`. (default: :obj:`None`)
             num_edges (int, optional) : The number of edges :math:`M`.
                 (default: :obj:`None`)
+            edge_gate (torch.Tensor, optional): per-hyperedge retention
+                :math:`r \in (0, 1)^M` scaling the edge->node message. Unlike
+                ``hyperedge_weight`` it does not enter the node degree D, so a node
+                that only lies in a low-retention edge is actually attenuated.
+                Fast (non-attention) path only. (default: :obj:`None`)
         """
         num_nodes = x.size(0)
 
@@ -208,6 +215,7 @@ class CustomHypergraphConv(MessagePassing):
         B[B == float("inf")] = 0
 
         if self.use_attention:
+            assert edge_gate is None, "edge_gate needs the fast (no-attention) path"
             out = self.propagate(
                 hyperedge_index, x=x, norm=B, alpha=alpha, size=(num_nodes, num_edges)
             )
@@ -237,6 +245,8 @@ class CustomHypergraphConv(MessagePassing):
             )
             out = x.new_zeros(num_edges, x.size(-1))
             out.index_add_(0, edge_idx, msg1)
+            if edge_gate is not None:
+                out = out * edge_gate.unsqueeze(-1)
 
             msg2 = D.index_select(0, node_idx).unsqueeze(-1) * out.index_select(
                 0, edge_idx
@@ -394,6 +404,28 @@ class HyCoRecModel(BaseModel):
         self.context_window_w = (
             opt.get("context_window_w", opt.get("hyperedge_window_k", None)) or 3
         )
+        # Scope-C retention (ReSCOPE): one alpha in (0,1) per window hyperedge (shared by the
+        # three fields) on how much an earlier relation persists into the current state.
+        #   retention: none (binary incidence, bit-identical to the original) | fixed
+        #   (alpha = retention_gamma ** age) | learned (RetentionGate; retention_use_age false
+        #   = content-only). retention_apply: both (message gate + readout weights) | readout.
+        #   retention_use_history false = latest valid window only. window_dedupe merges
+        #   identical windows (keeps the smallest age); off by default (changes the baseline).
+        self.retention = opt.get("retention", "none")
+        assert self.retention in ("none", "fixed", "learned")
+        self.retention_gamma = opt.get("retention_gamma", 0.8)
+        self.retention_use_age = opt.get("retention_use_age", True)
+        self.retention_use_history = opt.get("retention_use_history", True)
+        self.retention_apply = opt.get("retention_apply", "both")
+        assert self.retention_apply in ("both", "readout")
+        self.window_dedupe = opt.get("window_dedupe", False)
+        # control: permute alpha among the windows of a sample (keeps the per-sample scale,
+        # destroys which window gets which alpha) -- separates retention from a global C-row scale
+        self.retention_shuffle = opt.get("retention_shuffle", False)
+        self.retention_reg = opt.get("retention_reg", 0.0)  # weight of mean(alpha) penalty in the rec loss
+        self.ret_log = []  # per-sample {"q_age", "windows": [[age, alpha], ...]} when record_attn
+        self.ret_alpha_lt005 = [0, 0]  # (#alpha < 0.05, #alpha) over everything scored since reset
+        self._ret_pen = []  # mean gate per sample (for retention_reg)
         # Off by default: dropping the gold item from already-observed prefix/history
         # hyperedges would use the future label to rewrite the input (a repeat item
         # that was legitimately mentioned before t must stay). The prefix of turn t
@@ -729,6 +761,10 @@ class HyCoRecModel(BaseModel):
             # Â^G is unified (one stack "G") or per-field (one stack per field).
             self.hconv_g = nn.ModuleDict()
 
+        if self.retention == "learned" and "C" in self.scopes:
+            self.retention_gate = RetentionGate(
+                self.kg_emb_dim, n_fields=len(self._FIELDS), use_age=self.retention_use_age
+            )
         # learned per-field softmax fusion of the C/P/G pooled vectors (Eq. 11-12)
         self.fusion = ScopeFusion(init=self.alpha_init, freeze=self.freeze_alpha)
         # attention type
@@ -865,10 +901,15 @@ class HyCoRecModel(BaseModel):
             return self.hconv[field]
         return (self.hconv_p if scope == "P" else self.hconv_g)[field]
 
-    def _scope_hconv(self, scope, hyperedges, field, tot_embedding, exclude=None):
+    def _scope_hconv(
+        self, scope, hyperedges, field, tot_embedding, exclude=None, edge_gate=None, gate_conv=True
+    ):
         """Shared L-layer conv over a locally built incidence.
-        Returns (x_sub: (n_sub, d), tot2sub: dict) or (None, {})."""
-        uniq, coo, n_edges = build_incidence(hyperedges, exclude=exclude)
+        ``edge_gate``: optional (len(hyperedges),) retention aligned with the *input*
+        hyperedges (re-aligned here after empty edges are dropped). It gates the conv
+        messages when ``gate_conv`` and always sets ``self._node_w`` (node retention for the
+        readout). Returns (x_sub: (n_sub, d), tot2sub: dict) or (None, {})."""
+        uniq, coo, n_edges, kept = build_incidence(hyperedges, exclude=exclude, return_kept=True)
         if n_edges == 0 or not uniq:
             return None, {}
         tot2sub = {t: s for s, t in enumerate(uniq)}
@@ -878,21 +919,100 @@ class HyCoRecModel(BaseModel):
             dtype=torch.long,
             device=self.device,
         )
+        gate = None
+        if edge_gate is not None:
+            gate = edge_gate[torch.tensor(kept, dtype=torch.long, device=edge_gate.device)]
         for layer in self._stack_for(scope, field):
             x = F.dropout(x, p=self.hconv_dropout, training=self.training)
-            x = layer(x, ei, num_edges=n_edges)
+            x = layer(x, ei, num_edges=n_edges, edge_gate=gate if gate_conv else None)
+        if gate is not None:
+            # node retention = max gate over the hyperedges containing the node
+            # (readout weight in _pool_local); stored beside tot2sub, not inside it.
+            nw = torch.zeros(len(uniq), device=gate.device, dtype=gate.dtype)
+            nw = nw.scatter_reduce(0, ei[0], gate[ei[1]], reduce="amax", include_self=False)
+            self._node_w = nw
         return x, tot2sub
 
     def _empty_row(self, none_if_empty):
         return None if none_if_empty else torch.zeros(self.kg_emb_dim, device=self.device)
 
-    def _pool_local(self, x, tot2sub, query_nodes, none_if_empty=False):
+    def _pool_local(self, x, tot2sub, query_nodes, none_if_empty=False, node_w=None):
         if x is None:
             return self._empty_row(none_if_empty)
         rows = [tot2sub[v] for v in dict.fromkeys(query_nodes) if v in tot2sub]
         if not rows:
             return self._empty_row(none_if_empty)
+        if node_w is not None and self.fusion_keys != "node":
+            w = node_w[rows]
+            return (x[rows] * w.unsqueeze(-1)).sum(0) / w.sum().clamp_min(1e-6)
         return x[rows] if self.fusion_keys == "node" else x[rows].mean(dim=0)
+
+    def _context_retention(self, batch, b, field_x0):
+        """Scope-C windows of sample ``b`` and their retention.
+
+        Returns ``({field: (edges, ends, gate or None)}, log or None)``. ``gate`` is aligned
+        with ``edges``; all fields share one alpha per window end ``t'``. ``q`` is the
+        field-concatenated mean embedding of the latest valid window (never touches the
+        target: ``context_turn_*`` only holds turns before the prediction)."""
+        per = {}
+        for f in self._FIELDS:
+            turns = batch[f"context_turn_{f}"][b]
+            edges, ends = sliding_window_hyperedges(
+                turns, self.context_window_w, return_end=True, dedupe=self.window_dedupe
+            )
+            per[f] = [edges, ends]
+        t_last = len(batch["context_turn_entity"][b]) - 1
+        all_ends = sorted({e for f in per for e in per[f][1]})
+        if not all_ends:
+            return {f: (per[f][0], per[f][1], None) for f in per}, None
+        if not self.retention_use_history:  # latest valid window only
+            for f in per:
+                keep = [i for i, e in enumerate(per[f][1]) if e == all_ends[-1]]
+                per[f] = [[per[f][0][i] for i in keep], [per[f][1][i] for i in keep]]
+            all_ends = all_ends[-1:]
+        if self.retention == "none":
+            return {f: (per[f][0], per[f][1], None) for f in per}, None
+        ages = [t_last - e for e in all_ends]
+        if self.retention == "fixed":
+            alpha = torch.tensor(
+                [self.retention_gamma**a for a in ages], dtype=torch.float, device=self.device
+            )
+            q_age = 0
+        else:
+            row = {e: i for i, e in enumerate(all_ends)}
+            d = self.kg_emb_dim
+            h = torch.zeros(len(all_ends), len(self._FIELDS) * d, device=self.device)
+            for k, f in enumerate(self._FIELDS):
+                edges, ends = per[f]
+                if not edges:
+                    continue
+                x0 = field_x0[f]
+                idx = torch.tensor([v for e in edges for v in e], dtype=torch.long, device=self.device)
+                seg = torch.tensor(
+                    [i for i, e in enumerate(edges) for _ in e], dtype=torch.long, device=self.device
+                )
+                cnt = torch.tensor([len(e) for e in edges], dtype=x0.dtype, device=self.device)
+                rep = x0.new_zeros(len(edges), d).index_add(0, seg, x0[idx]) / cnt.unsqueeze(-1)
+                rows = torch.tensor([row[e] for e in ends], dtype=torch.long, device=self.device)
+                h[:, k * d : (k + 1) * d] = h[:, k * d : (k + 1) * d].index_copy(0, rows, rep)
+            alpha = self.retention_gate(h, h[-1], ages)
+            q_age = ages[-1]
+        if self.retention_shuffle and alpha.numel() > 1:
+            alpha = alpha[torch.randperm(alpha.numel(), device=alpha.device)]
+        amap = {e: i for i, e in enumerate(all_ends)}
+        out = {
+            f: (per[f][0], per[f][1], alpha[[amap[e] for e in per[f][1]]] if per[f][1] else None)
+            for f in per
+        }
+        with torch.no_grad():
+            self.ret_alpha_lt005[0] += int((alpha < 0.05).sum())
+            self.ret_alpha_lt005[1] += alpha.numel()
+        if self.retention_reg > 0 and self.training:
+            self._ret_pen.append(alpha.mean())
+        log = None
+        if self.record_attn:
+            log = {"q_age": q_age, "windows": [[a, float(x)] for a, x in zip(ages, alpha.tolist())]}
+        return out, log
 
     def _gather_dense(self, xg, query_nodes):
         rows = sorted({v for v in query_nodes if 0 <= v < xg.size(0)})
@@ -948,6 +1068,11 @@ class HyCoRecModel(BaseModel):
         for b in range(bsz):
             target = int(batch["item"][b]) if self.exclude_target and "item" in batch else None
             has_history = bool(batch["has_history"][b])
+            c_info, sample_ret = (
+                self._context_retention(batch, b, field_x0) if "C" in self.scopes else (None, None)
+            )
+            ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
+            ctx_b = field_x0["entity"][ctx_ids] if ctx_ids else None
             per_field = []
             c_rows, p_rows, g_parts, g_ids = [], [], [], []
             for field in self._FIELDS:
@@ -956,11 +1081,16 @@ class HyCoRecModel(BaseModel):
 
                 # scope C: sliding-window hyperedges (spec v2.1 Eq. 2)
                 if "C" in self.scopes:
-                    ctx_edges = sliding_window_hyperedges(
-                        batch[f"context_turn_{field}"][b], self.context_window_w
+                    ctx_edges, _, gate = c_info[field]
+                    self._node_w = None
+                    xc, mc = self._scope_hconv(
+                        "C", ctx_edges, field, x0, exclude=target,
+                        edge_gate=gate, gate_conv=self.retention_apply == "both",
                     )
-                    xc, mc = self._scope_hconv("C", ctx_edges, field, x0, exclude=target)
-                    p_c = self._pool_local(xc, mc, readout, none_if_empty=rows7)
+                    p_c = self._pool_local(
+                        xc, mc, readout, none_if_empty=rows7,
+                        node_w=self._node_w if gate is not None else None,
+                    )
                 else:
                     p_c = self._empty_row(rows7)
 
@@ -1028,8 +1158,9 @@ class HyCoRecModel(BaseModel):
                 fused_all.append(self._stack_rows(c_rows + p_rows + [r_g]))
             else:
                 fused_all.append(torch.stack(per_field, dim=0))
-            ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
-            ctx_all.append(field_x0["entity"][ctx_ids] if ctx_ids else None)
+            if self.record_attn and self.retention != "none":
+                self.ret_log.append(sample_ret)
+            ctx_all.append(ctx_b)
         return fused_all, ctx_all
 
     def _stack_rows(self, rows7):
@@ -1200,6 +1331,9 @@ class HyCoRecModel(BaseModel):
         e_i = self._candidate_table(item_embedding, xg_by_field)
         scores = F.linear(user_embedding, e_i, self.rec_bias.bias)
         loss = self.rec_loss(scores, item)
+        if self.retention_reg > 0 and self._ret_pen:
+            loss = loss + self.retention_reg * torch.stack(self._ret_pen).mean()
+        self._ret_pen = []
         return loss, scores
 
     def _starts(self, batch_size):
@@ -1218,7 +1352,7 @@ class HyCoRecModel(BaseModel):
             self.fusion,
             self.item_attn,
             self.rec_bias,
-            *[getattr(self, n) for n in ("scope_emb", "cand_free") if hasattr(self, n)],
+            *[getattr(self, n) for n in ("scope_emb", "cand_free", "retention_gate") if hasattr(self, n)],
         ]
         if hasattr(self, "row_logits"):
             self.row_logits.requires_grad = False

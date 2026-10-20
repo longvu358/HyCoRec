@@ -99,7 +99,30 @@ CELLS.update({
     "s8_A10": _cell("extra-S8", {"scope_embed": True}, prio=3, note="learned scope embedding e_k added to each row"),
     "s8_A12": _cell("extra-S8", {"scope_weights": "shared"}, prio=3, note="one HConv stack shared by C/P/G"),
     "s8_A13": _cell("extra-S8", {"g_readout": "balanced"}, prio=3, note="r^G = mean of per-node-type means"),
+
+    # RQ2 (ReSCOPE): relation formation (window w) x relation persistence (retention). All cells dedupe
+    # identical windows, so only `full` (no dedupe, no retention) is the legacy sliding-window floor.
+    "r2_latest": _cell("extra-S12", {"window_dedupe": True, "retention_use_history": False}, prio=2,
+                       note="Latest relation only: just the latest valid window (sliding-window baseline)"),
+    "r2_turn": _cell("extra-S12", {"window_dedupe": True, "context_window_w": 1}, prio=2,
+                     note="Turn-level full history: w=1, no cross-turn formation, no retention"),
+    "r2_uniform": _cell("extra-S12", {"window_dedupe": True}, prio=2, ckpt=True,
+                        note="Uniform relational history: all windows, alpha = 1"),
+    "r2_readout": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_apply": "readout"},
+                        prio=2, note="Learned readout only"),
+    "r2_noage": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_use_age": False},
+                      prio=2, note="ReSCOPE w/o age (content only)"),
+    "r2_shuffle": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_shuffle": True},
+                        prio=2, ckpt=True, note="control: learned alpha permuted among the windows of a sample"),
+    "r2_rescope": _cell("extra-S12", {"window_dedupe": True, "retention": "learned"}, prio=2, ckpt=True,
+                        rec_only=True, note="ReSCOPE: learned alpha on propagation + readout"),
 })
+# Fixed temporal decay alpha = gamma^age; gamma tuned on valid with the same budget as the other variants.
+# gamma = 1 must reproduce r2_uniform (sanity); small gamma approaches Latest-only.
+for _g in (1.0, 0.95, 0.85, 0.7, 0.5):
+    CELLS[f"r2_fixed_g{str(_g).replace('.', '')}"] = _cell(
+        "extra-S12", {"window_dedupe": True, "retention": "fixed", "retention_gamma": _g}, prio=2,
+        note=f"Fixed temporal decay gamma={_g}")
 
 # Analyses on the saved checkpoints (no extra training):
 #   RQ3  C@5/10/15/20 + LT@10  : `analyze --cells full hycorec_repro`, `report --exp RQ3`

@@ -436,7 +436,7 @@ def main():
     for name, fn in (("plan", cmd_plan), ("run", cmd_run), ("summarize", cmd_summarize),
                      ("analyze", cmd_analyze), ("report", cmd_report)):
         p = sub.add_parser(name)
-        p.add_argument("--exp", nargs="*", help="RQ1 RQ4 RQ5 extra-S2 extra-S3 extra-S4 extra-S8")
+        p.add_argument("--exp", nargs="*", help="RQ1 RQ4 RQ5 extra-S2 extra-S3 extra-S4 extra-S8 extra-S12")
         p.add_argument("--cells", nargs="*")
         p.add_argument("--dataset", nargs="*", choices=list(M.DATASETS))
         p.add_argument("--seeds", nargs="*", type=int, default=None, help="default: per-cell (3 seeds; RQ5 one)")

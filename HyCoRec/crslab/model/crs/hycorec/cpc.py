@@ -15,6 +15,7 @@ The per-scope hypergraph convolution itself reuses ``CustomHypergraphConv`` from
 ``hycorec.py`` (same weights across scopes -- spec 3.1).
 """
 
+import math
 import os
 import random
 
@@ -59,7 +60,7 @@ def khop_closure(seeds, adj, k, max_neighbors=None):
     return seen
 
 
-def sliding_window_hyperedges(turn_lists, w):
+def sliding_window_hyperedges(turn_lists, w, return_end=False, dedupe=False):
     """Scope C hyperedges (spec v2.1 Eq. 2 / Eq. 4 in the simple write-up).
 
     One hyperedge per turn position ``t' <= t``, each the union of the ``w``
@@ -71,19 +72,33 @@ def sliding_window_hyperedges(turn_lists, w):
     ``turn_lists``: ordered list of per-turn node-id lists (turn-local, as
     shipped by the dataloader's ``context_turn_<field>``). Hyperedges with
     fewer than 2 members after merging are dropped (spec: no degree-0 edges).
+
+    ``return_end=True`` returns ``(edges, ends)`` where ``ends[i]`` is the turn
+    position ``t'`` the i-th kept hyperedge ends at (needed for the retention
+    age ``T - t'``; dropped edges make the list index differ from ``t'``).
+
+    ``dedupe=True`` merges windows with an identical node set (turns that
+    mention nothing make consecutive windows coincide) and keeps the one with
+    the smallest age, i.e. the largest ``t'``. Off by default: it changes the
+    binary incidence of the original sliding-window baseline.
     """
-    edges = []
+    edges, ends = [], []
     for t_prime in range(len(turn_lists)):
         window = turn_lists[max(0, t_prime - w + 1) : t_prime + 1]
         merged = set()
         for turn in window:
             merged.update(turn)
         if len(merged) >= 2:
-            edges.append(sorted(merged))
-    return edges
+            members = sorted(merged)
+            if dedupe and edges and edges[-1] == members:
+                ends[-1] = t_prime  # same node set as the previous window: newer end wins
+                continue
+            edges.append(members)
+            ends.append(t_prime)
+    return (edges, ends) if return_end else edges
 
 
-def build_incidence(hyperedges, exclude=None):
+def build_incidence(hyperedges, exclude=None, return_kept=False):
     """Build a binary hypergraph incidence in COO form.
 
     Args:
@@ -95,17 +110,22 @@ def build_incidence(hyperedges, exclude=None):
         ``(unique_nodes, [node_ids, edge_ids], n_edges)`` -- plain python lists,
         kept on CPU (the caller remaps to a local sub-index before uploading a
         single tensor, as in ``HyCoRecModel._before_hyperconv``).
+        With ``return_kept=True`` a 4th element lists, for every kept
+        hyperedge, its index in the input ``hyperedges`` (to align per-edge
+        quantities such as retention gates after empty edges are dropped).
     """
-    node_ids, edge_ids = [], []
+    node_ids, edge_ids, kept = [], [], []
     n_edges = 0
-    for members in hyperedges:
+    for src, members in enumerate(hyperedges):
         uniq = [v for v in dict.fromkeys(members) if v != exclude]
         if not uniq:
             continue
+        kept.append(src)
         node_ids.extend(uniq)
         edge_ids.extend([n_edges] * len(uniq))
         n_edges += 1
-    return list(dict.fromkeys(node_ids)), [node_ids, edge_ids], n_edges
+    out = list(dict.fromkeys(node_ids)), [node_ids, edge_ids], n_edges
+    return out + (kept,) if return_kept else out
 
 
 def a_hat_from_incidence(incidence_csc):
@@ -212,3 +232,50 @@ class ScopeFusion(nn.Module):
             f: torch.softmax(self.logits[f], dim=0).detach().cpu().tolist()
             for f in self.logits
         }
+
+
+def age_bucket(age, n_buckets=16):
+    """Age 0..7 keep their own bucket, older ages are binned on a log2 scale
+    (two buckets per octave) and clipped at ``n_buckets - 1``."""
+    age = max(0, int(age))
+    if age < 8:
+        return min(age, n_buckets - 1)
+    return min(8 + int(2 * math.log2(age / 8)), n_buckets - 1)
+
+
+class RetentionGate(nn.Module):
+    """Scope-C retention, one alpha per window ``e`` shared by the three fields.
+
+    ``alpha_e = sigmoid(MLP([h_e; h_e * q; phi(age_e)]) + b)`` with ``h_e`` the
+    concatenation of the per-field mean node embeddings of the window (before
+    propagation, so alpha does not depend on its own propagated state), ``q`` the
+    same vector for the latest valid window, and ``phi`` a learned embedding of
+    the bucketed age (``use_age=False`` drops it: content-only). The last MLP
+    layer starts at 0 and a fixed offset ``init_bias`` so alpha starts at
+    ``sigmoid(init_bias) ~ 0.95`` (close to uniform history).
+    """
+
+    def __init__(self, dim, n_fields=3, hidden=64, use_age=True, n_buckets=16, init_bias=3.0):
+        super().__init__()
+        self.use_age, self.n_buckets = use_age, n_buckets
+        d_in = 2 * n_fields * dim
+        if use_age:
+            self.age_emb = nn.Embedding(n_buckets, 16)
+            nn.init.normal_(self.age_emb.weight, std=0.1)
+            d_in += 16
+        self.mlp = nn.Sequential(nn.Linear(d_in, hidden), nn.Tanh(), nn.Linear(hidden, 1))
+        nn.init.zeros_(self.mlp[2].weight)
+        nn.init.zeros_(self.mlp[2].bias)
+        # fixed offset instead of a learned bias: AdamW's weight decay then pulls the
+        # gate towards the neutral alpha = sigmoid(init_bias) (uniform history), not towards 0.5
+        self.register_buffer("base_logit", torch.tensor(float(init_bias)))
+
+    def forward(self, h, q, ages):
+        """``h``: (m, F*d), ``q``: (F*d,), ``ages``: list[int] of length m -> (m,)."""
+        feats = [h, h * q.unsqueeze(0)]
+        if self.use_age:
+            idx = torch.tensor(
+                [age_bucket(a, self.n_buckets) for a in ages], dtype=torch.long, device=h.device
+            )
+            feats.append(self.age_emb(idx))
+        return torch.sigmoid(self.mlp(torch.cat(feats, dim=-1)).squeeze(-1) + self.base_logit)

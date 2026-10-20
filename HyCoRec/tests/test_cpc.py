@@ -255,3 +255,61 @@ def test_scope_weights_separate_vs_shared():
     assert len(ids) == 3
     m.scope_weights = "shared"
     assert all(st(sc, "entity") is m.hconv["entity"] for sc in "CPG")
+
+
+# --------------------------------------------------------------------------
+# scope-C retention (ReSCOPE)
+# --------------------------------------------------------------------------
+def test_sliding_window_return_end_tracks_dropped_edges():
+    turns = [[1], [2], [3, 4], [5]]  # w=1: turn 0 and 1 and 3 have <2 members
+    edges, ends = sliding_window_hyperedges(turns, 1, return_end=True)
+    assert edges == [[3, 4]] and ends == [2]
+    edges, ends = sliding_window_hyperedges(turns, 2, return_end=True)
+    assert ends == [1, 2, 3]
+
+
+def test_build_incidence_kept_alignment():
+    uniq, coo, n, kept = build_incidence([[7], [], [1, 2], [7, 3]], exclude=7, return_kept=True)
+    assert kept == [2, 3] and n == 2
+
+
+def _conv():
+    from crslab.model.crs.hycorec.hycorec import CustomHypergraphConv
+
+    torch.manual_seed(0)
+    return CustomHypergraphConv(4, 4)
+
+
+def test_edge_gate_one_is_identity_and_zero_removes_edge():
+    conv = _conv()
+    x = torch.randn(4, 4)
+    ei = torch.tensor([[0, 1, 1, 2, 3], [0, 0, 1, 1, 1]])
+    base = conv(x, ei, num_edges=2)
+    assert torch.allclose(conv(x, ei, num_edges=2, edge_gate=torch.ones(2)), base)
+    gated = conv(x, ei, num_edges=2, edge_gate=torch.tensor([1.0, 0.0]))
+    # node 3 sits only in the muted edge: it keeps just the bias; D stays unweighted
+    assert torch.allclose(gated[3], conv.bias)
+    # node 0 sits only in edge 0 -> unchanged vs. ungated
+    assert torch.allclose(gated[0], base[0])
+
+
+def test_retention_gate_init_and_age_bucket():
+    from crslab.model.crs.hycorec.cpc import RetentionGate, age_bucket
+
+    assert [age_bucket(a) for a in (0, 7, 8, 11, 16, 32, 10**6)] == [0, 7, 8, 8, 10, 12, 15]
+    gate = RetentionGate(4, n_fields=3, init_bias=3.0)
+    h = torch.randn(2, 12)
+    r = gate(h, h[-1], [0, 5])
+    assert torch.allclose(r, torch.sigmoid(torch.tensor(3.0)).expand(2))
+    r.sum().backward()
+    assert gate.mlp[2].bias.grad is not None
+    noage = RetentionGate(4, n_fields=3, use_age=False)
+    assert not hasattr(noage, "age_emb") and noage(h, h[-1], [0, 5]).shape == (2,)
+
+
+def test_window_dedupe_keeps_smallest_age():
+    turns = [[1, 2], [], [], [3, 4]]  # w=2: windows end 0,1 identical ([1,2]); 2 -> [], 3 -> [3,4]
+    edges, ends = sliding_window_hyperedges(turns, 2, return_end=True)
+    assert edges == [[1, 2], [1, 2], [3, 4]] and ends == [0, 1, 3]
+    edges, ends = sliding_window_hyperedges(turns, 2, return_end=True, dedupe=True)
+    assert edges == [[1, 2], [3, 4]] and ends == [1, 3]
