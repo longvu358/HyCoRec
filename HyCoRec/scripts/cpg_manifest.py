@@ -131,6 +131,13 @@ for _g in (1.0, 0.95, 0.85, 0.7, 0.5):
         "extra-S12", {"window_dedupe": True, "retention": "fixed", "retention_gamma": _g}, prio=2,
         note=f"Fixed temporal decay gamma={_g}")
 
+# extra-S13: composition of the user-side G query Q^G (Q^P is ~93% of readout + Q^P). Baseline = r2_uniform
+# (same overrides, g_query ctx+hist). The candidate-side X^G term (ei_mode xg) is untouched by these cells.
+for _q, _note in (("ctx", "r^G from the dialogue readout only"), ("hist", "r^G from Q^P only"),
+                  ("split", "two G rows (r^G_ctx, r^G_hist), 8 keys")):
+    CELLS[f"g_q_{_q}"] = _cell("extra-S13", {"window_dedupe": True, "g_query": _q}, prio=1, ckpt=True,
+                               note=_note)
+
 # Analyses on the saved checkpoints (no extra training):
 #   RQ3  C@5/10/15/20 + LT@10  : `analyze --cells full hycorec_repro`, `report --exp RQ3`
 #   RQ6  top-5 case table      : same dumps, `report --exp RQ6`

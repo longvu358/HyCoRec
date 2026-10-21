@@ -338,7 +338,7 @@ def bucket(v, edges):
 
 def mean_attn(rows):
     out = []
-    for lo, hi in ((0, 3), (3, 6), (6, 7)):
+    for lo, hi in ((0, 3), (3, 6), (6, None)):  # G = row 6, plus row 7 (r^G_hist) when g_query: split
         vals = [sum(r["attn"][lo:hi]) for r in rows if r["attn"][0] == r["attn"][0]]  # skip NaN
         out.append(sum(vals) / len(vals) if vals else float("nan"))
     return out

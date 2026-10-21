@@ -474,6 +474,13 @@ class HyCoRecModel(BaseModel):
         self.scope_embed = opt.get("scope_embed", False)  # S8 A10: learned e_k added to row k
         self.g_readout = opt.get("g_readout", "mean")  # S8 A13: "balanced" = mean of per-node-type means for r^G
         assert self.fusion_keys in ("pooled", "node") and self.g_readout in ("mean", "balanced")
+        # Q^G for the user-side r^G: ctx+hist (readout + Q^P, original) | ctx (readout only) |
+        # hist (Q^P only) | split (two rows r^G_ctx, r^G_hist -> 8 keys; rows-type fusion only).
+        # Q^P is ~93% of the joint set, so the joint mean is history-dominated.
+        self.g_query = opt.get("g_query", "ctx+hist")
+        assert self.g_query in ("ctx+hist", "ctx", "hist", "split")
+        assert self.g_query != "split" or self.fusion_mode != "field"
+        self.n_rows = 8 if self.g_query == "split" else 7
         # xg: E = X^(0)_I + X^G[V_E] (Eq. 17) | base: E = X^(0)_I (no G term) | S3 controls:
         # free (free table instead of G), xg_perm (X^G rows permuted), xg_detach (stop-grad on the candidate path)
         self.ei_mode = opt.get("ei_mode", "xg")
@@ -791,10 +798,10 @@ class HyCoRecModel(BaseModel):
         # attention type
         self.item_attn = MHItemAttention(self.kg_emb_dim, self.mha_n_heads)
         if self.scope_embed:
-            self.scope_emb = nn.Embedding(7, self.kg_emb_dim)
+            self.scope_emb = nn.Embedding(self.n_rows, self.kg_emb_dim)
             nn.init.normal_(self.scope_emb.weight, std=self.kg_emb_dim**-0.5)
         if self.fusion_mode == "global_alpha":
-            self.row_logits = nn.Parameter(torch.zeros(7))
+            self.row_logits = nn.Parameter(torch.zeros(self.n_rows))
         if self.ei_mode == "free":
             self.cand_free = nn.Embedding(self.n_entity, self.kg_emb_dim)
             nn.init.normal_(self.cand_free.weight, std=self.kg_emb_dim**-0.5)
@@ -1098,7 +1105,9 @@ class HyCoRecModel(BaseModel):
             ctx_ids = [v for v in dict.fromkeys(batch["readout_entity"][b])]
             ctx_b = field_x0["entity"][ctx_ids] if ctx_ids else None
             per_field = []
-            c_rows, p_rows, g_parts, g_ids = [], [], [], []
+            c_rows, p_rows = [], []
+            g_keys = ("ctx", "hist") if self.g_query == "split" else ("joint",)
+            g_parts, g_ids = {k: [] for k in g_keys}, {k: [] for k in g_keys}
             for field in self._FIELDS:
                 x0 = field_x0[field]
                 readout = batch[f"readout_{field}"][b]
@@ -1132,19 +1141,21 @@ class HyCoRecModel(BaseModel):
                     p_p, q_p = (None if rows7 else p_c), []
 
                 # scope G
+                q_g = self._g_query_sets(readout, q_p)
                 if "G" in self.scopes and xg_by_field is not None and self.g_unified:
                     off = field_x0["entity"].size(0) if field == "word" else 0
-                    g_ids.extend(v + off for v in list(readout) + list(q_p))
+                    for k, q in q_g.items():
+                        g_ids[k].extend(v + off for v in q)
                     p_g = None
                 elif "G" in self.scopes and xg_by_field is not None:
-                    q_g = list(readout) + list(q_p)
                     if rows7:
-                        g = self._gather_dense(xg_by_field[field], q_g)
-                        if g is not None:
-                            g_parts.append(g)
+                        for k, q in q_g.items():
+                            g = self._gather_dense(xg_by_field[field], q)
+                            if g is not None:
+                                g_parts[k].append(g)
                         p_g = None
                     else:
-                        p_g = self._pool_dense(xg_by_field[field], q_g)
+                        p_g = self._pool_dense(xg_by_field[field], q_g["joint"])
                 else:
                     p_g = self._empty_row(rows7)
 
@@ -1156,36 +1167,43 @@ class HyCoRecModel(BaseModel):
                         self.fusion.fuse(field, p_c, p_p, p_g, has_history=p_used_history)
                     )
             if rows7:
-                # r^G: unified Â^G (Eq. 9-10) if loaded, else the interim mean
-                # over Q^G gathered across the three per-field Â^G_f.
-                node_keys = self.fusion_keys == "node"
-                if self.g_unified and xg_by_field is not None:
-                    # Eq. 9-10: Q^G over the unified index space, one mean
-                    xg = xg_by_field["G"]
-                    if self.g_readout == "balanced":
-                        n_e = field_x0["entity"].size(0)
-                        parts = [self._gather_dense(xg, [v for v in g_ids if (v < n_e) == is_ent])
-                                 for is_ent in (True, False)]
-                        parts = [g for g in parts if g is not None]
-                        r_g = torch.stack([g.mean(0) for g in parts]).mean(0) if parts else None
-                    else:
-                        g = self._gather_dense(xg, g_ids)
-                        r_g = None if g is None else (g if node_keys else g.mean(0))
-                elif g_parts:
-                    if self.g_readout == "balanced":  # mean of the per-field means
-                        r_g = torch.stack([g.mean(0) for g in g_parts]).mean(0)
-                    else:
-                        r_g = torch.cat(g_parts, 0)
-                        r_g = r_g if node_keys else r_g.mean(0)
-                else:
-                    r_g = None
-                fused_all.append(self._stack_rows(c_rows + p_rows + [r_g]))
+                r_g = [self._g_row(g_ids[k], g_parts[k], field_x0, xg_by_field) for k in g_keys]
+                fused_all.append(self._stack_rows(c_rows + p_rows + r_g))
             else:
                 fused_all.append(torch.stack(per_field, dim=0))
             if self.record_attn and self.retention != "none":
                 self.ret_log.append(sample_ret)
             ctx_all.append(ctx_b)
         return fused_all, ctx_all
+
+    def _g_query_sets(self, readout, q_p):
+        """Q^G node lists keyed like ``g_keys`` in ``_cpc_field_preferences``."""
+        if self.g_query == "split":
+            return {"ctx": list(readout), "hist": list(q_p)}
+        q = {"ctx+hist": list(readout) + list(q_p), "ctx": list(readout), "hist": list(q_p)}
+        return {"joint": q[self.g_query]}
+
+    def _g_row(self, g_ids, g_parts, field_x0, xg_by_field):
+        """r^G from one Q^G: unified Â^G (Eq. 9-10) if loaded, else the interim mean
+        over Q^G gathered across the three per-field Â^G_f. None if Q^G is empty."""
+        node_keys = self.fusion_keys == "node"
+        if self.g_unified and xg_by_field is not None:
+            # Eq. 9-10: Q^G over the unified index space, one mean
+            xg = xg_by_field["G"]
+            if self.g_readout == "balanced":
+                n_e = field_x0["entity"].size(0)
+                parts = [self._gather_dense(xg, [v for v in g_ids if (v < n_e) == is_ent])
+                         for is_ent in (True, False)]
+                parts = [g for g in parts if g is not None]
+                return torch.stack([g.mean(0) for g in parts]).mean(0) if parts else None
+            g = self._gather_dense(xg, g_ids)
+            return None if g is None else (g if node_keys else g.mean(0))
+        if g_parts:
+            if self.g_readout == "balanced":  # mean of the per-field means
+                return torch.stack([g.mean(0) for g in g_parts]).mean(0)
+            r_g = torch.cat(g_parts, 0)
+            return r_g if node_keys else r_g.mean(0)
+        return None
 
     def _stack_rows(self, rows7):
         """Non-empty rows of [r^C_I,r^C_E,r^C_W, r^P_I,r^P_E,r^P_W, r^G] -> (n, d).
@@ -1296,11 +1314,11 @@ class HyCoRecModel(BaseModel):
         return torch.stack(user_repr_list, dim=0), xg_by_field
 
     def _log_attn(self, ids, rows, ctx):
-        share = [float("nan")] * 7
+        share = [float("nan")] * self.n_rows
         w = self.item_attn.last_weights
         if (self.fusion_mode in ("rows7", "field") and rows.size(0) and ctx is not None
                 and w is not None and w.size(1) == len(ids)):
-            acc = [0.0] * 7
+            acc = [0.0] * self.n_rows
             for k, v in zip(ids, w.mean(0).tolist()):
                 acc[k] += v
             share = acc

@@ -62,6 +62,19 @@ Diễn giải tạm: end-to-end loss không có tín hiệu để gate ưu tiên
 4. Kiểm cross-fitting của scope G trước khi chốt số RQ1.
 5. Nếu cần so sánh: `r2_uniform`, `r2_fixed_g07`, `r2_latest`, `r2_shuffle` cùng seed (đang bỏ qua).
 
+## Vòng 3 — đối chứng uniform vs fixed (hredial, seed 3407, rec-only, log/20261021-222655)
+Lưu ý: cả hai run dùng `hconv_dropout: 0.3` (commit 218bae2); các run vòng 2 ở local dùng 0.2, nên không so trực tiếp với vòng 2.
+
+| cell | ep chọn | valid R@10 / R@50 | test R@1 | test R@10 | test R@50 | MRR@10 | NDCG@10 | tail R@10 / R@50 |
+|---|---|---|---|---|---|---|---|---|
+| r2_uniform (α=1) | 5 | .1977 / .4226 | .0265 | .1692 | .3537 | .0624 | .0872 | .0057 / .0412 |
+| r2_fixed_g07 (α=0.7^age, scale, both) | 4 | .1907 / .4180 | .0272 | .1688 | .3549 | .0624 | .0871 | .0067 / .0373 |
+
+- Không phân biệt được: chênh test ≤ .0012 ở mọi metric chính, đổi dấu giữa R@10 và R@50. Đường cong valid theo epoch trùng nhau ±.004. Fixed bị chọn ep4 chỉ vì R@50 ep5 hoà ep4 (.4180).
+- Gap valid→test của uniform (+.029) cũng lớn như của các run retention, nên **gap không do retention** mà do cấu hình chung của các cell r2 (`rec_only` / `window_dedupe` / `hconv_dropout`).
+- Phép thử tuyến tính không cần train (proxy wᵀÂ^G) cho cùng kết luận: decay trên phần ngữ cảnh chỉ thêm khoảng +0.3–1 điểm R@10. Trong khi đó, truy vấn G (`readout + q_p`) gồm khoảng 93% node history; trộn history với trọng số 1 làm proxy R@10 giảm từ .219 xuống .102 (ReDial) và từ .080 xuống .001 (TG).
+- Hệ quả: retention ở scope C hiện không tạo chênh lệch đo được. Nên ưu tiên sửa cách tạo truy vấn G (tách context và history) trước khi đưa α sang G.
+
 ## Ghi chú vận hành
 - Máy local 7 GB RAM: full hredial gần hết bộ nhớ; chạy tuần tự. Remote dùng `config` khác local (lr 0.0005, wd 0.1, clip 1).
 - Config `r2_*` sinh bằng `python scripts/run_cpg.py gen` (không commit).

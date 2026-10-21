@@ -336,3 +336,33 @@ def test_retention_gate_decay_prior_starts_at_gamma_pow_age():
     h = torch.randn(3, 12)
     r = gate(h, h[-1], [0, 2, 4])
     assert torch.allclose(r, torch.tensor([0.98, 0.75**2, 0.75**4]).clamp(0.02, 0.98), atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# G query composition (g_query)
+# --------------------------------------------------------------------------
+def _g_stub(g_query, d=4):
+    from types import SimpleNamespace
+
+    from crslab.model.crs.hycorec.hycorec import HyCoRecModel
+
+    m = SimpleNamespace(g_query=g_query, g_unified=False, g_readout="mean", fusion_keys="pooled")
+    m._gather_dense = lambda xg, q: HyCoRecModel._gather_dense(m, xg, q)
+    sets = lambda r, q: HyCoRecModel._g_query_sets(m, r, q)
+    row = lambda ids, parts: HyCoRecModel._g_row(m, ids, parts, None, None)
+    return sets, row
+
+
+def test_g_query_sets_and_rows():
+    from crslab.model.crs.hycorec.hycorec import HyCoRecModel
+
+    readout, q_p = [1, 2], [2, 5, 7]
+    assert _g_stub("ctx+hist")[0](readout, q_p) == {"joint": [1, 2, 2, 5, 7]}
+    assert _g_stub("ctx")[0](readout, q_p) == {"joint": [1, 2]}
+    assert _g_stub("hist")[0](readout, q_p) == {"joint": [2, 5, 7]}
+    sets, row = _g_stub("split")
+    assert sets(readout, q_p) == {"ctx": [1, 2], "hist": [2, 5, 7]}
+    xg = torch.arange(32, dtype=torch.float).view(8, 4)
+    g = HyCoRecModel._gather_dense(None, xg, [1, 2, 2])
+    assert torch.allclose(row([], [g]), xg[[1, 2]].mean(0))  # duplicates counted once
+    assert row([], []) is None  # empty Q^G -> row dropped from the key set
