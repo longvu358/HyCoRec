@@ -35,8 +35,25 @@ Phân tích α: `python scripts/extra/ret_alpha.py <dump.jsonl>`. Mọi con số
   `r2_rescope_ip` chạy xong 1.8 phút, không Traceback/NaN. **Chưa** so lại `none` với HEAD ở mức model sau thay đổi
   này (chỉ có test đơn vị α=1); chưa có run đủ dữ liệu.
 
+### Kết quả vòng 2 (hredial, seed 3407, rec-only, log/20261021-170912)
+| cell | valid R@10 (tốt nhất) | test R@10 | α mean | α<0.05 | corr(age,α) |
+|---|---|---|---|---|---|
+| r2_rescope (v1 scale) | 0.1904 | 0.1665 | 0.989 | ~0% | ≈0 (phẳng) |
+| r2_rescope_i (interp) | 0.2000 (ep5) | 0.1667 | 0.029 | 88% | -0.13 |
+| r2_rescope_ip (interp+decay) | 0.2015 (ep5) | 0.1671 | 0.011 | 96% | -0.35 |
+| full (không retention, 4 seed) | — | 0.168–0.173 | — | — | — |
+
+Quan sát:
+- **α sập về ≈0**, ngược vòng 1 (≈1). Với `interp`, α→0 nghĩa là hàng C không nhận message nào: gate học cách *tắt scope C*, không học cách quên chọn lọc. `ip` khởi tạo ở 0.75^age nhưng cả age 0 cũng về 0.036.
+- Phương sai trong mẫu (0.014–0.031) nhỏ hơn giữa các mẫu (0.015–0.045) → α vẫn là hệ số thang theo mẫu, không phải bộ chọn window. `q_age>0` = 0% (q luôn là window mới nhất).
+- Test R@10 của 3 biến thể retention (0.1665/0.1667/0.1671) gần như trùng nhau và thấp hơn `full` (~0.172) khoảng 0.005. Chưa kết luận được: `full` là run joint, chưa có đối chứng cùng ngân sách (`r2_uniform`).
+- Khoảng cách valid→test lớn (0.20 → 0.167); rec_loss train giảm 7.9→4.3 còn valid loss tăng từ epoch 3: overfit mạnh, điều này giải thích vì sao tắt hàng C có thể được thưởng.
+- Chưa dùng được làm bằng chứng cho claim "learned retention" trong abstract.
+
+Diễn giải tạm: end-to-end loss không có tín hiệu để gate ưu tiên window gần; nó chỉ thấy C là nguồn overfit. Gate hiện tại ≠ retention theo nghĩa của paper.
+
 ### Cần làm tiếp
-1. Trên remote: chạy `r2_rescope_i` và `r2_rescope_ip` (seed 3407, rec, 10 epoch), `analyze`, rồi `ret_alpha.py`.
+1. (Đã xong, xem kết quả trên) chạy `r2_rescope_i` và `r2_rescope_ip` (seed 3407, rec, 10 epoch), `analyze`, rồi `ret_alpha.py`.
    Câu hỏi: α có còn ≈ 1 và phẳng theo tuổi không? Với `ip`, α có rời khỏi `0.75^age` không (nếu bám sát prior thì gate chỉ là decay cố định)?
 2. Nếu α vẫn phẳng/≈1: cân nhắc giám sát trực tiếp (C: BCE phụ với nhãn utility = giao với láng giềng KG của item đích; target chỉ vào loss).
 3. Viết phân tích utility (leave-one-edge-out, riêng tập target warm 11.7%).
