@@ -26,11 +26,15 @@ from crslab.data.dataset import *
 dataset_register_table = {
     'HReDial': HReDialDataset,
     'HTGReDial': HTGReDialDataset,
+    'OpenDialKG': OpenDialKGDataset,
+    'DuRecDial': DuRecDialDataset,
 }
 
 dataset_language_map = {
     'HReDial': 'en',
     'HTGReDial': 'zh',
+    'OpenDialKG': 'en',
+    'DuRecDial': 'zh',
 }
 
 dataloader_register_table = {

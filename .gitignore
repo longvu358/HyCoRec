@@ -1,5 +1,5 @@
 **/.omc
-log/
+log*
 __pycache__/
 *.pyc
 
@@ -21,3 +21,6 @@ compress_data
 
 **/ablation/_runs/
 save
+
+MHIM
+pretrain

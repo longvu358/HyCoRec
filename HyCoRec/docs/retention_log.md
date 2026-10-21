@@ -44,10 +44,12 @@ Phân tích α: `python scripts/extra/ret_alpha.py <dump.jsonl>`. Mọi con số
 | full (không retention, 4 seed) | — | 0.168–0.173 | — | — | — |
 
 Quan sát:
-- **α sập về ≈0**, ngược vòng 1 (≈1). Với `interp`, α→0 nghĩa là hàng C không nhận message nào: gate học cách *tắt scope C*, không học cách quên chọn lọc. `ip` khởi tạo ở 0.75^age nhưng cả age 0 cũng về 0.036.
+- **α sập về ≈0**, ngược vòng 1 (≈1). Với `interp`, α→0 nghĩa là hàng C không còn propagation qua hyperedge (node giữ embedding thô, pooled trung bình vẫn còn): gate học cách *tắt conv của scope C*, không học cách quên chọn lọc. `ip` khởi tạo ở 0.75^age nhưng cả age 0 cũng về 0.036.
 - Phương sai trong mẫu (0.014–0.031) nhỏ hơn giữa các mẫu (0.015–0.045) → α vẫn là hệ số thang theo mẫu, không phải bộ chọn window. `q_age>0` = 0% (q luôn là window mới nhất).
 - Test R@10 của 3 biến thể retention (0.1665/0.1667/0.1671) gần như trùng nhau và thấp hơn `full` (~0.172) khoảng 0.005. Chưa kết luận được: `full` là run joint, chưa có đối chứng cùng ngân sách (`r2_uniform`).
 - Khoảng cách valid→test lớn (0.20 → 0.167); rec_loss train giảm 7.9→4.3 còn valid loss tăng từ epoch 3: overfit mạnh, điều này giải thích vì sao tắt hàng C có thể được thưởng.
+- Cảnh báo: gap valid→test của các run retention (+0.03) lớn hơn hẳn `full` (+0.008); chưa rõ do retention, `window_dedupe` hay `rec_only` (cần `r2_uniform` để tách).
+- `alpha_f` trong log là vết của `ScopeFusion` không dùng khi `fusion_mode: rows7` (không phải lỗi).
 - Chưa dùng được làm bằng chứng cho claim "learned retention" trong abstract.
 
 Diễn giải tạm: end-to-end loss không có tín hiệu để gate ưu tiên window gần; nó chỉ thấy C là nguồn overfit. Gate hiện tại ≠ retention theo nghĩa của paper.

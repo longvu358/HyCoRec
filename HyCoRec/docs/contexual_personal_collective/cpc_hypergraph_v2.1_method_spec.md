@@ -1,4 +1,4 @@
-# CPC-Hypergraph v2 — Đặc tả phương pháp để cài đặt
+# CPC-Hypergraph v2.1 — Đặc tả phương pháp để cài đặt
 
 Tài liệu này là bản đặc tả đầy đủ (ký hiệu → dựng dữ liệu → mô hình → mất mát → huấn luyện → ablation) cho phiên bản đơn giản. Mọi thứ không được nhắc tới trong đây thì **giữ nguyên HyCoRec** (code gốc `zysensmile/HyCoRec`, nền CRSLab). Các mục có nhãn **[bắt buộc]** là phần phải cài; **[tùy chọn]** là biến thể để ablation.
 

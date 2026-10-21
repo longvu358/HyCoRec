@@ -5,7 +5,9 @@ from edger import redial_edger, tgredial_edger, opendialkg_edger, durecdial_edge
 
 dataset_edger_map = {
     "redial": redial_edger,
+    "hredial": redial_edger,
     "tgredial": tgredial_edger,
+    "htgredial": tgredial_edger,
     "opendialkg": opendialkg_edger,
     "durecdial": durecdial_edger,
 }

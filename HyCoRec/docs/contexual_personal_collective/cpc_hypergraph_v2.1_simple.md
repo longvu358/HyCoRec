@@ -1,4 +1,4 @@
-# CPC-Hypergraph v2 — Tổng quan phương pháp (bản khớp với đặc tả)
+# CPC-Hypergraph v2.1 — Tổng quan phương pháp (bản khớp với đặc tả)
 
 Tài liệu này là bản tóm tắt khái niệm, giữ đồng bộ 1-1 với đặc tả kỹ thuật (`cpc_hypergraph_v2_method_spec.md`). Dùng để viết phần Method của bài báo.
 

@@ -13,8 +13,8 @@ num_bases: 8
 n_heads: 2
 n_layers: 2
 ffn_size: 300
-dropout: 0.1
-attention_dropout: 0.0
+dropout: 0.3
+attention_dropout: 0.1
 relu_dropout: 0.1
 learn_positional_embeddings: false
 embeddings_scale: true
@@ -29,7 +29,9 @@ scopes:
 k_hist: 40
 k_hop: 1
 context_window_w: 3
+exclude_target: false
 hconv_layers: 2
+hconv_dropout: 0.2
 fusion_mode: rows7
 scope_weights: separate
 alpha_init:
@@ -43,28 +45,30 @@ use_review_hypergraph: false
 review_index_path: null
 rec:
   epoch: 10
-  batch_size: 64
+  batch_size: 256
   early_stop: true
-  stop_mode: min
-  stop_metric: rec_loss
-  impatience: 4
+  stop_mode: max
+  stop_metric: recall@50
+  impatience: 3
   optimizer:
     name: AdamW
     lr: 0.0005
+    weight_decay: 0.1
+  gradient_clip: 1
   lr_scheduler:
     name: ReduceLROnPlateau
-    mode: min
-    patience: 1
+    mode: max
+    patience: 0
     factor: 0.5
 conv:
   epoch: 5
-  batch_size: 32
+  batch_size: 64
   optimizer:
     name: AdamW
     lr: 0.001
   lr_scheduler:
     name: ReduceLROnPlateau
-    patience: 1
+    patience: 0
     factor: 0.5
   gradient_clip: 0.1
 mhim_extension: Adaptive

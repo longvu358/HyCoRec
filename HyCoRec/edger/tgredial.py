@@ -1,19 +1,22 @@
 import json
+import pickle
 
 from tqdm import tqdm
 
-DATA_ROOT = "data/dataset/tgredial/pkuseg"
+DATA_ROOT = "data/dataset/htgredial/pkuseg"
 
 def get_side_data():
-    side_data = []
-    with open(f"{DATA_ROOT}/cn-dbpedia.txt", "r", encoding="utf-8") as file:
-        for line in file:
-            [a, _, b] = line.split("\t")
-            b = b[:-1] if b[-1] == "\n" else b
-            side_data.append((a, b))
+    # HTGReDial ships its KG as (head_id, tail_id, relation_id) triples inside
+    # side_data.pkl (ids in entity2id's space), not a raw cn-dbpedia.txt dump.
+    side_data_pkl = pickle.load(open(f"{DATA_ROOT}/side_data.pkl", "rb"))
+    entity2id = json.load(open(f"{DATA_ROOT}/entity2id.json", "r", encoding="utf-8"))
+    id2entity = {v: k for k, v in entity2id.items()}
 
     entity_side = {}
-    for a, b in tqdm(side_data):
+    for h, t, _r in tqdm(side_data_pkl["entity_kg"]["edge"]):
+        if h not in id2entity or t not in id2entity:
+            continue
+        a, b = id2entity[h], id2entity[t]
         if a in entity_side:
             entity_side[a].add(b)
         else:

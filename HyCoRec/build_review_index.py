@@ -48,22 +48,27 @@ import os
 import pickle
 import re
 from collections import Counter, defaultdict
+from urllib.parse import unquote
 
 from tqdm import tqdm
 
 from crslab.config import DATA_PATH, DATASET_PATH, ROOT_PATH
 
-REVIEW_RAW_DIR = os.path.join(ROOT_PATH, "..", "data", "reviews", "raw", "revcore")
+REVIEW_RAW_DIR = os.path.join(DATA_PATH, "reviews", "raw", "revcore")
 DOUBAN_RAW_DIR = os.path.join(DATA_PATH, "reviews", "raw", "douban1000w")
 DEFAULT_TOKENIZE = {"hredial": "nltk", "htgredial": "pkuseg"}
 
 POS_THRESHOLD = 0.05  # spec 1.3: compound >= 0.05 -> sent(q) = +1
 MIN_REVIEW_WORDS = 5  # drop junk entries like "SPOILERS" (docs/review_data_qc.md)
-MAX_PHRASE_WORDS = 6  # longest entity surface form we bother trying to match
+MAX_PHRASE_WORDS = 8  # longest entity surface form (in tokens) we bother trying to match
 MIN_SURFACE_CHARS = 4  # drop noise like "It", "Up" from the linking dictionary
 
 _DISAMBIG_SUFFIX = re.compile(r"_\([^)]*\)$")
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'.]*|[0-9]+")
+# Unicode alphanumeric runs: punctuation (sentence-final '.', ',', '-', apostrophes) is a
+# separator, so "Spielberg." / "Spider-Man" / "Zoë" tokenise the same on the text side and
+# the entity-name side. Possessive 's is dropped from the text first.
+_WORD_RE = re.compile(r"[^\W_]+")
+_POSSESSIVE = re.compile(r"['\u2019]s\b")
 
 # zh (Douban short comments)
 POS_STAR = 4  # Star >= 4 -> positive (replaces VADER, which is English-only)
@@ -92,9 +97,12 @@ def build_surface_index(entity2id, item_ids):
     for uri, eid in entity2id.items():
         if eid in item_ids:
             continue
-        name = uri.rsplit("/", 1)[-1].rstrip(">")
+        name = unquote(uri.rsplit("/", 1)[-1].rstrip(">"))
         name = _DISAMBIG_SUFFIX.sub("", name).replace("_", " ").strip()
         if len(name) < MIN_SURFACE_CHARS or not name[:1].isupper():
+            continue
+        name = " ".join(_WORD_RE.findall(_POSSESSIVE.sub("", name)))  # same normalisation as the text side
+        if not name:
             continue
         if name in index and index[name] != eid:
             ambiguous.add(name)
@@ -107,7 +115,7 @@ def build_surface_index(entity2id, item_ids):
 
 def link_entities(sentence, surface_index, max_words=MAX_PHRASE_WORDS):
     """Greedy longest-match phrase lookup against `surface_index`."""
-    tokens = _WORD_RE.findall(sentence)
+    tokens = _WORD_RE.findall(_POSSESSIVE.sub("", sentence))
     n = len(tokens)
     found = []
     i = 0
