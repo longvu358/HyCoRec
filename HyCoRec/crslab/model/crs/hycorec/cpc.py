@@ -252,12 +252,18 @@ class RetentionGate(nn.Module):
     same vector for the latest valid window, and ``phi`` a learned embedding of
     the bucketed age (``use_age=False`` drops it: content-only). The last MLP
     layer starts at 0 and a fixed offset ``init_bias`` so alpha starts at
-    ``sigmoid(init_bias) ~ 0.95`` (close to uniform history).
+    ``sigmoid(init_bias) ~ 0.95`` (close to uniform history), or at ``gamma ** age`` with
+    ``prior='decay'`` (the empirical decay of the dialogue statistics).
     """
 
-    def __init__(self, dim, n_fields=3, hidden=64, use_age=True, n_buckets=16, init_bias=3.0):
+    def __init__(
+        self, dim, n_fields=3, hidden=64, use_age=True, n_buckets=16, init_bias=3.0,
+        prior="uniform", gamma=0.75,
+    ):
         super().__init__()
+        assert prior in ("uniform", "decay")
         self.use_age, self.n_buckets = use_age, n_buckets
+        self.prior, self.gamma = prior, float(gamma)
         d_in = 2 * n_fields * dim
         if use_age:
             self.age_emb = nn.Embedding(n_buckets, 16)
@@ -278,4 +284,10 @@ class RetentionGate(nn.Module):
                 [age_bucket(a, self.n_buckets) for a in ages], dtype=torch.long, device=h.device
             )
             feats.append(self.age_emb(idx))
-        return torch.sigmoid(self.mlp(torch.cat(feats, dim=-1)).squeeze(-1) + self.base_logit)
+        base = self.base_logit
+        if self.prior == "decay":  # start from alpha(age) = gamma ** age, weight decay pulls back to it
+            p = torch.tensor(
+                [self.gamma ** max(0, int(a)) for a in ages], dtype=h.dtype, device=h.device
+            ).clamp(0.02, 0.98)
+            base = torch.log(p) - torch.log1p(-p)
+        return torch.sigmoid(self.mlp(torch.cat(feats, dim=-1)).squeeze(-1) + base)

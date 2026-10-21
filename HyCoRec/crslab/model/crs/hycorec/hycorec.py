@@ -127,6 +127,7 @@ class CustomHypergraphConv(MessagePassing):
         hyperedge_attr: Optional[Tensor] = None,
         num_edges: Optional[int] = None,
         edge_gate: Optional[Tensor] = None,
+        gate_interp: bool = False,
     ) -> Tensor:
         r"""Runs the forward pass of the module.
 
@@ -150,6 +151,10 @@ class CustomHypergraphConv(MessagePassing):
                 ``hyperedge_weight`` it does not enter the node degree D, so a node
                 that only lies in a low-retention edge is actually attenuated.
                 Fast (non-attention) path only. (default: :obj:`None`)
+            gate_interp (bool): with ``edge_gate``, interpolate instead of attenuate:
+                each incidence contributes ``r_e * message + (1 - r_e) * x_v`` so a muted
+                relation falls back to the node's own embedding and the output scale does
+                not depend on ``r``. ``r = 1`` is the plain conv either way.
         """
         num_nodes = x.size(0)
 
@@ -253,6 +258,11 @@ class CustomHypergraphConv(MessagePassing):
             )
             out = x.new_zeros(num_nodes, x.size(-1))
             out.index_add_(0, node_idx, msg2)
+            if edge_gate is not None and gate_interp:
+                miss = scatter(
+                    1.0 - edge_gate[edge_idx], node_idx, dim=0, dim_size=num_nodes, reduce="sum"
+                )
+                out = out + (D * miss).unsqueeze(-1) * x
 
         if self.concat is True:
             out = out.view(-1, self.heads * self.out_channels)
@@ -417,6 +427,13 @@ class HyCoRecModel(BaseModel):
         self.retention_use_age = opt.get("retention_use_age", True)
         self.retention_use_history = opt.get("retention_use_history", True)
         self.retention_apply = opt.get("retention_apply", "both")
+        # gate form on the conv messages: scale (r * message, legacy) | interp (r * message +
+        # (1 - r) * own embedding; scale-preserving, r = 1 is the plain conv)
+        self.retention_gate_mode = opt.get("retention_gate_mode", "scale")
+        assert self.retention_gate_mode in ("scale", "interp")
+        # initial alpha(age): uniform (sigmoid(3) for all ages) | decay (gamma ** age, retention_gamma)
+        self.retention_prior = opt.get("retention_prior", "uniform")
+        assert self.retention_prior in ("uniform", "decay")
         assert self.retention_apply in ("both", "readout")
         self.window_dedupe = opt.get("window_dedupe", False)
         # control: permute alpha among the windows of a sample (keeps the per-sample scale,
@@ -763,7 +780,11 @@ class HyCoRecModel(BaseModel):
 
         if self.retention == "learned" and "C" in self.scopes:
             self.retention_gate = RetentionGate(
-                self.kg_emb_dim, n_fields=len(self._FIELDS), use_age=self.retention_use_age
+                self.kg_emb_dim,
+                n_fields=len(self._FIELDS),
+                use_age=self.retention_use_age,
+                prior=self.retention_prior,
+                gamma=self.retention_gamma,
             )
         # learned per-field softmax fusion of the C/P/G pooled vectors (Eq. 11-12)
         self.fusion = ScopeFusion(init=self.alpha_init, freeze=self.freeze_alpha)
@@ -924,7 +945,10 @@ class HyCoRecModel(BaseModel):
             gate = edge_gate[torch.tensor(kept, dtype=torch.long, device=edge_gate.device)]
         for layer in self._stack_for(scope, field):
             x = F.dropout(x, p=self.hconv_dropout, training=self.training)
-            x = layer(x, ei, num_edges=n_edges, edge_gate=gate if gate_conv else None)
+            x = layer(
+                x, ei, num_edges=n_edges, edge_gate=gate if gate_conv else None,
+                gate_interp=self.retention_gate_mode == "interp",
+            )
         if gate is not None:
             # node retention = max gate over the hyperedges containing the node
             # (readout weight in _pool_local); stored beside tot2sub, not inside it.

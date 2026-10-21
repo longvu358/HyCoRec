@@ -115,7 +115,14 @@ CELLS.update({
     "r2_shuffle": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_shuffle": True},
                         prio=2, ckpt=True, note="control: learned alpha permuted among the windows of a sample"),
     "r2_rescope": _cell("extra-S12", {"window_dedupe": True, "retention": "learned"}, prio=2, ckpt=True,
-                        rec_only=True, note="ReSCOPE: learned alpha on propagation + readout"),
+                        rec_only=True, note="ReSCOPE v1: learned alpha, attenuating gate (alpha -> 1 in the first run)"),
+    "r2_rescope_i": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_gate_mode": "interp"},
+                          prio=1, ckpt=True, rec_only=True,
+                          note="ReSCOPE v2 (A): alpha interpolates message vs own embedding (scale-preserving)"),
+    "r2_rescope_ip": _cell("extra-S12", {"window_dedupe": True, "retention": "learned", "retention_gate_mode": "interp",
+                                         "retention_prior": "decay", "retention_gamma": 0.75},
+                           prio=1, ckpt=True, rec_only=True,
+                           note="ReSCOPE v2 + (B): alpha starts at 0.75^age (empirical decay), interp gate"),
 })
 # Fixed temporal decay alpha = gamma^age; gamma tuned on valid with the same budget as the other variants.
 # gamma = 1 must reproduce r2_uniform (sanity); small gamma approaches Latest-only.

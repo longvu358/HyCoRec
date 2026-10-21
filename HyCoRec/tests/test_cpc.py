@@ -313,3 +313,26 @@ def test_window_dedupe_keeps_smallest_age():
     assert edges == [[1, 2], [1, 2], [3, 4]] and ends == [0, 1, 3]
     edges, ends = sliding_window_hyperedges(turns, 2, return_end=True, dedupe=True)
     assert edges == [[1, 2], [3, 4]] and ends == [1, 3]
+
+
+def test_edge_gate_interp_identity_and_self_fallback():
+    conv = _conv()
+    x = torch.randn(4, 4)
+    ei = torch.tensor([[0, 1, 1, 2, 3], [0, 0, 1, 1, 1]])
+    base = conv(x, ei, num_edges=2)
+    assert torch.allclose(
+        conv(x, ei, num_edges=2, edge_gate=torch.ones(2), gate_interp=True), base, atol=1e-6
+    )
+    g = conv(x, ei, num_edges=2, edge_gate=torch.tensor([1.0, 0.0]), gate_interp=True)
+    # node 3 only lies in the muted edge: it keeps its own (projected) embedding + bias, not just the bias
+    assert torch.allclose(g[3], conv.lin(x)[3] + conv.bias, atol=1e-6)
+    assert torch.allclose(g[0], base[0], atol=1e-6)
+
+
+def test_retention_gate_decay_prior_starts_at_gamma_pow_age():
+    from crslab.model.crs.hycorec.cpc import RetentionGate
+
+    gate = RetentionGate(4, n_fields=3, prior="decay", gamma=0.75)
+    h = torch.randn(3, 12)
+    r = gate(h, h[-1], [0, 2, 4])
+    assert torch.allclose(r, torch.tensor([0.98, 0.75**2, 0.75**4]).clamp(0.02, 0.98), atol=1e-5)
