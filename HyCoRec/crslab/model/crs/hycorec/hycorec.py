@@ -422,8 +422,11 @@ class HyCoRecModel(BaseModel):
         #   retention_use_history false = latest valid window only. window_dedupe merges
         #   identical windows (keeps the smallest age); off by default (changes the baseline).
         self.retention = opt.get("retention", "none")
-        assert self.retention in ("none", "fixed", "learned")
+        assert self.retention in ("none", "fixed", "learned", "const")
         self.retention_gamma = opt.get("retention_gamma", 0.8)
+        # const: alpha = retention_const for every window, conv gate only (readout stays unweighted).
+        # With retention_gate_mode interp and 0, scope C keeps lin(x) + b: no message crosses a hyperedge.
+        self.retention_const = opt.get("retention_const", 0.0)
         self.retention_use_age = opt.get("retention_use_age", True)
         self.retention_use_history = opt.get("retention_use_history", True)
         self.retention_apply = opt.get("retention_apply", "both")
@@ -1009,6 +1012,9 @@ class HyCoRecModel(BaseModel):
                 [self.retention_gamma**a for a in ages], dtype=torch.float, device=self.device
             )
             q_age = 0
+        elif self.retention == "const":
+            alpha = torch.full((len(ages),), float(self.retention_const), device=self.device)
+            q_age = 0
         else:
             row = {e: i for i, e in enumerate(all_ends)}
             d = self.kg_emb_dim
@@ -1122,7 +1128,7 @@ class HyCoRecModel(BaseModel):
                     )
                     p_c = self._pool_local(
                         xc, mc, readout, none_if_empty=rows7,
-                        node_w=self._node_w if gate is not None else None,
+                        node_w=self._node_w if gate is not None and self.retention != "const" else None,
                     )
                 else:
                     p_c = self._empty_row(rows7)

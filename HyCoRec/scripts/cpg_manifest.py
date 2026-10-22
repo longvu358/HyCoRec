@@ -123,6 +123,11 @@ CELLS.update({
                                          "retention_prior": "decay", "retention_gamma": 0.75},
                            prio=1, ckpt=True, rec_only=True,
                            note="ReSCOPE v2 + (B): alpha starts at 0.75^age (empirical decay), interp gate"),
+    # control for r2_rescope_ip, whose alpha collapses to ~0.01: same interp gate with alpha = 0 exactly,
+    # i.e. scope C without propagation (each node keeps lin(x) + b). Same R@1/MRR as ip => gain is "no C conv".
+    "r2_c_noprop": _cell("extra-S12", {"window_dedupe": True, "retention": "const", "retention_const": 0.0,
+                                       "retention_gate_mode": "interp"}, prio=1, ckpt=True, rec_only=True,
+                         note="control: interp gate, alpha = 0 (scope C without hyperedge propagation)"),
 })
 # Fixed temporal decay alpha = gamma^age; gamma tuned on valid with the same budget as the other variants.
 # gamma = 1 must reproduce r2_uniform (sanity); small gamma approaches Latest-only.

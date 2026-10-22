@@ -75,6 +75,46 @@ Lưu ý: cả hai run dùng `hconv_dropout: 0.3` (commit 218bae2); các run vòn
 - Phép thử tuyến tính không cần train (proxy wᵀÂ^G) cho cùng kết luận: decay trên phần ngữ cảnh chỉ thêm khoảng +0.3–1 điểm R@10. Trong khi đó, truy vấn G (`readout + q_p`) gồm khoảng 93% node history; trộn history với trọng số 1 làm proxy R@10 giảm từ .219 xuống .102 (ReDial) và từ .080 xuống .001 (TG).
 - Hệ quả: retention ở scope C hiện không tạo chênh lệch đo được. Nên ưu tiên sửa cách tạo truy vấn G (tách context và history) trước khi đưa α sang G.
 
+## Vòng 4 — thành phần truy vấn G (`g_query`, extra-S13) + `r2_rescope_ip` với dropout 0.3 (hredial, log/20261022-021023, -021049)
+Tất cả dùng `hconv_dropout: 0.3`, `window_dedupe`, rec-only. Baseline `r2_uniform` có 3 seed (3407 lấy từ log/20261021-222655).
+Δ là chênh lệch ghép cặp theo seed so với `r2_uniform`.
+
+| cell | n seed | R@1 | R@10 | R@50 | MRR@10 | NDCG@10 | ΔR@10 theo seed (42 / 123 / 3407) |
+|---|---|---|---|---|---|---|---|
+| r2_uniform (`ctx+hist`) | 3 | .0281±.0024 | .1688±.0023 | .3515±.0020 | .0629±.0016 | .0875±.0007 | — |
+| g_q_ctx | 3 | .0279±.0024 | .1693±.0043 | .3507±.0008 | .0622±.0009 | .0870±.0002 | −.0019 / +.0006 / +.0029 |
+| g_q_split | 3 | .0292±.0012 | .1682±.0032 | .3526±.0013 | .0634±.0014 | .0877±.0016 | −.0017 / −.0013 / +.0013 |
+| g_q_hist | 1 | .0267 | .1613 | .3472 | .0615 | .0848 | – / – / −.0079 |
+| r2_rescope_ip (dropout 0.3) | 1 | .0324 | .1700 | .3537 | .0671 | .0910 | – / – / +.0008 |
+
+- **`ctx` và `split` ≈ `ctx+hist`**: mọi Δ trung bình ≤ .0011, nhỏ hơn std giữa các seed. Phép thử tuyến tính (history làm loãng truy vấn G,
+  R@10 proxy giảm từ .219 xuống .102) **không chuyển thành kết quả trên mô hình đã train**: mô hình đã bù được, nên phần history trong r^G là thừa chứ không có hại.
+- **`hist` (bỏ ngữ cảnh khỏi truy vấn G) thấp hơn khoảng .008 R@10** (khoảng 3.4 std của uniform, 1 seed): phần ngữ cảnh của r^G là phần có ích; phần history trùng với P.
+- Hệ quả: dùng `g_query: ctx` được như một cách đơn giản hoá (truy vấn nhỏ hơn, khoảng 19.9 phút/epoch so với 21.4), nhưng không phải nguồn cải thiện. Đưa retention vào G không còn lý do.
+- **`r2_rescope_ip` ở dropout 0.3** cho kết quả đầu bảng tốt hơn rõ: R@1 +.0058, MRR@10 +.0047, NDCG@10 +.0038 so với uniform seed 3407. R@1 .0324 và MRR .0671
+  cao hơn cả 9 run còn lại, nhưng R@10/R@50 không đổi. Mới có 1 seed; vòng 2 (dropout 0.2) không thấy hiệu ứng này. Chi phí khoảng 27.6 phút/epoch (+30%).
+  Cần thêm seed 42/123 và dump α trước khi kết luận.
+
+## Vòng 5 — thêm seed cho fixed/ip (hredial, log/20261022-142619) + TG `g_query` (log/20261022-124627)
+**hredial, 3 seed (3407 / 42 / 123), dropout 0.3, Δ ghép cặp so với `r2_uniform`:**
+
+| cell | R@1 | R@10 | R@50 | MRR@10 | NDCG@10 | tail R@50 | phút/epoch |
+|---|---|---|---|---|---|---|---|
+| r2_uniform | .0281±.0024 | .1688±.0023 | .3515±.0020 | .0629±.0016 | .0875±.0007 | .0370 | ~21.4 |
+| r2_fixed_g07 | .0285 (+.0003) | .1699 (+.0011) | .3541 (**+.0026**) | .0632 (+.0003) | .0880 (+.0004) | .0380 | ~23 |
+| r2_rescope_ip | **.0327±.0007 (+.0045)** | .1669 (−.0019) | .3543 (+.0028) | **.0663 (+.0034)** | **.0897 (+.0022)** | .0332 (−.0038) | ~27 |
+
+- ip: ΔR@1 theo seed +.0025 / +.0052 / +.0058 và ΔMRR@10 +.0017 / +.0038 / +.0047, **dương ở cả 3 seed** (t ghép cặp ≈ 4.4, df=2).
+  Hiệu ứng tập trung ở đầu bảng xếp hạng; ΔR@10 theo seed lẫn dấu (+.0008 / −.0015 / −.0050), tail R@50 giảm. R@1 có std .0007, ổn định hơn hẳn uniform (.0024).
+- fixed γ=0.7: ΔR@50 +.0012 / +.0040 / +.0025, dương ở cả 3 seed nhưng nhỏ (≈ 1 std); đầu bảng không đổi. Vậy **decay cố định không tạo ra hiệu ứng đầu bảng của ip**.
+- Chưa tách được nguyên nhân: ip khác fixed ở **cả** cổng nội suy (`interp`), α học được, lẫn prior decay. Vòng 2 cho thấy α của ip sập về khoảng 0, tức scope C gần như
+  tắt propagation qua hyperedge. Giả thuyết cạnh tranh: lợi ích đến từ "C không propagate" chứ không phải từ retention. Cần: dump α của ip ở dropout 0.3,
+  và đối chứng `interp` với α cố định bằng 0 (chưa có cell).
+
+**TG-ReDial, seed 3407:** uniform R@10 .0277 / R@50 .0701; g_q_ctx .0284 / .0708; g_q_split .0274 / .0701; g_q_hist .0277 / .0701 (gần như trùng với uniform ở từng epoch).
+- Mọi Δ ≤ .0007, trong khi std giữa các seed của `full` TG là khoảng .003 R@10. Việc g_q_hist trùng uniform đến 4 chữ số cho thấy ở TG, hàng G phía user gần như không được dùng.
+- Số TG ở công thức này (.020–.028) thấp hơn MHIM (.031) và HyCoRec* (.0377); valid rec_loss tăng 10.6 → 18.7. Công thức TG cần xử lý riêng trước khi so các biến thể nhỏ.
+
 ## Ghi chú vận hành
 - Máy local 7 GB RAM: full hredial gần hết bộ nhớ; chạy tuần tự. Remote dùng `config` khác local (lr 0.0005, wd 0.1, clip 1).
 - Config `r2_*` sinh bằng `python scripts/run_cpg.py gen` (không commit).
