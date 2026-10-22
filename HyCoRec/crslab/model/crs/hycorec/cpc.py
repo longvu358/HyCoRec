@@ -291,3 +291,67 @@ class RetentionGate(nn.Module):
             ).clamp(0.02, 0.98)
             base = torch.log(p) - torch.log1p(-p)
         return torch.sigmoid(self.mlp(torch.cat(feats, dim=-1)).squeeze(-1) + base)
+
+
+class EvidenceRetention(nn.Module):
+    """Scope-C retention as a per-relation forget gate driven by what happened after the relation.
+
+    A relation is a window ``e`` (end turn ``t_e``). Each later context turn ``t in (t_e, T]`` can
+    weaken it: ``f_{e,t} = sigmoid(MLP([h_e; u_t; h_e * u_t; ov(e, t)]) + b0)``, so
+    ``log rho_e = sum_t log(1 - f_{e,t})`` is non-increasing in time and the latest window has
+    ``rho = 1`` (empty sum) -- the anchor the older relations are measured against. ``ov`` is the
+    share of e's nodes re-mentioned at ``t`` (explicit reinforcement). The readout score is
+    ``(W_q u_T) . (W_k h_e) / sqrt(d) + log rho_e`` (softmax over windows outside this module):
+    relevance to the current turn selects, retention discounts. ``h_e`` / ``u_t`` are pre-propagation
+    field-concatenated mean embeddings of the window / turn, so the score never sees the target.
+
+    forget: evidence (above) | age (one learned per-turn forget rate) | const (``1 - gamma``, i.e.
+    ``rho = gamma ** age``) | none (``rho = 1``). ``relevance=False`` drops the attention term.
+    Both learned terms start neutral: W_k = 0 (no relevance), forget ~ sigmoid(b0) ~ 0.018 per turn.
+    """
+
+    def __init__(self, dim, n_fields=3, hidden=64, forget="evidence", relevance=True, overlap=True,
+                 gamma=0.75, init_forget=-4.0, d_att=64):
+        super().__init__()
+        assert forget in ("evidence", "age", "const", "none")
+        self.forget, self.relevance, self.overlap = forget, relevance, overlap
+        self.gamma, self.d_att = float(gamma), d_att
+        d = n_fields * dim
+        if relevance:
+            self.w_q = nn.Linear(d, d_att, bias=False)
+            self.w_k = nn.Linear(d, d_att, bias=False)
+            nn.init.zeros_(self.w_k.weight)
+        if forget == "evidence":
+            self.mlp = nn.Sequential(nn.Linear(3 * d + int(overlap), hidden), nn.Tanh(), nn.Linear(hidden, 1))
+            nn.init.zeros_(self.mlp[2].weight)
+            nn.init.zeros_(self.mlp[2].bias)
+            # fixed offset (not a learned bias): weight decay pulls towards "almost never forget"
+            self.register_buffer("base_logit", torch.tensor(float(init_forget)))
+        elif forget == "age":
+            self.rate_logit = nn.Parameter(torch.tensor(float(init_forget)))
+
+    def log_retention(self, h, ends, u, ov):
+        """``h``: (m, D) windows, ``ends``: (m,) long, ``u``: (n_turns, D), ``ov``: (m, n_turns) -> (m,)."""
+        n_turns = u.size(0)
+        t = torch.arange(n_turns, device=h.device)
+        later = (t.unsqueeze(0) > ends.unsqueeze(1)).to(h.dtype)  # (m, n_turns): turns after the window
+        if self.forget == "none":
+            return h.new_zeros(h.size(0))
+        if self.forget == "const":
+            return later.sum(1) * math.log(self.gamma)
+        if self.forget == "age":
+            return later.sum(1) * F.logsigmoid(-self.rate_logit)
+        m = h.size(0)
+        he, ut = h.unsqueeze(1).expand(m, n_turns, -1), u.unsqueeze(0).expand(m, n_turns, -1)
+        feats = [he, ut, he * ut] + ([ov.unsqueeze(-1)] if self.overlap else [])
+        logit = self.mlp(torch.cat(feats, -1)).squeeze(-1) + self.base_logit
+        return (later * F.logsigmoid(-logit)).sum(1)  # log(1 - sigmoid(z)) = logsigmoid(-z)
+
+    def forward(self, h, ends, u, ov, q=None):
+        """``q``: (D,) current-turn query (default ``u[-1]``). Returns (score (m,), log rho (m,))."""
+        log_rho = self.log_retention(h, ends, u, ov)
+        score = log_rho
+        if self.relevance:
+            q = self.w_q(u[-1] if q is None else q)
+            score = score + (self.w_k(h) @ q) / math.sqrt(self.d_att)
+        return score, log_rho

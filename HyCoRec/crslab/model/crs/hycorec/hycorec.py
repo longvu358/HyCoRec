@@ -32,6 +32,7 @@ from crslab.config import DATA_PATH, DATASET_PATH
 from crslab.model.base import BaseModel
 from crslab.model.crs.hycorec.attention import MHItemAttention
 from crslab.model.crs.hycorec.cpc import (
+    EvidenceRetention,
     RetentionGate,
     ScopeFusion,
     build_incidence,
@@ -422,11 +423,19 @@ class HyCoRecModel(BaseModel):
         #   retention_use_history false = latest valid window only. window_dedupe merges
         #   identical windows (keeps the smallest age); off by default (changes the baseline).
         self.retention = opt.get("retention", "none")
-        assert self.retention in ("none", "fixed", "learned", "const")
+        assert self.retention in ("none", "fixed", "learned", "const", "evidence")
         self.retention_gamma = opt.get("retention_gamma", 0.8)
         # const: alpha = retention_const for every window, conv gate only (readout stays unweighted).
         # With retention_gate_mode interp and 0, scope C keeps lin(x) + b: no message crosses a hyperedge.
         self.retention_const = opt.get("retention_const", 0.0)
+        # evidence: relation-level readout, softmax_e(relevance(u_T, h_e) + log rho_e) with rho_e the
+        # product of per-later-turn forget gates (cpc.EvidenceRetention); the conv is never gated.
+        # retention_forget: evidence | age | const (rho = gamma^age) | none; c_propagate false keeps
+        # scope C as lin(x) + b (interp gate at 0, as r2_c_noprop).
+        self.retention_forget = opt.get("retention_forget", "evidence")
+        self.retention_relevance = opt.get("retention_relevance", True)
+        self.retention_overlap = opt.get("retention_overlap", True)
+        self.c_propagate = opt.get("c_propagate", True)
         self.retention_use_age = opt.get("retention_use_age", True)
         self.retention_use_history = opt.get("retention_use_history", True)
         self.retention_apply = opt.get("retention_apply", "both")
@@ -788,6 +797,15 @@ class HyCoRecModel(BaseModel):
             # Â^G is unified (one stack "G") or per-field (one stack per field).
             self.hconv_g = nn.ModuleDict()
 
+        if self.retention == "evidence" and "C" in self.scopes:
+            self.retention_gate = EvidenceRetention(
+                self.kg_emb_dim,
+                n_fields=len(self._FIELDS),
+                forget=self.retention_forget,
+                relevance=self.retention_relevance,
+                overlap=self.retention_overlap,
+                gamma=self.retention_gamma,
+            )
         if self.retention == "learned" and "C" in self.scopes:
             self.retention_gate = RetentionGate(
                 self.kg_emb_dim,
@@ -957,7 +975,8 @@ class HyCoRecModel(BaseModel):
             x = F.dropout(x, p=self.hconv_dropout, training=self.training)
             x = layer(
                 x, ei, num_edges=n_edges, edge_gate=gate if gate_conv else None,
-                gate_interp=self.retention_gate_mode == "interp",
+                # evidence never gates the conv; its only gate is the all-zero one of c_propagate=false
+                gate_interp=self.retention_gate_mode == "interp" or self.retention == "evidence",
             )
         if gate is not None:
             # node retention = max gate over the hyperedges containing the node
@@ -1007,6 +1026,8 @@ class HyCoRecModel(BaseModel):
         if self.retention == "none":
             return {f: (per[f][0], per[f][1], None) for f in per}, None
         ages = [t_last - e for e in all_ends]
+        if self.retention == "evidence":
+            return self._evidence_retention(batch, b, per, all_ends, ages, field_x0)
         if self.retention == "fixed":
             alpha = torch.tensor(
                 [self.retention_gamma**a for a in ages], dtype=torch.float, device=self.device
@@ -1016,22 +1037,7 @@ class HyCoRecModel(BaseModel):
             alpha = torch.full((len(ages),), float(self.retention_const), device=self.device)
             q_age = 0
         else:
-            row = {e: i for i, e in enumerate(all_ends)}
-            d = self.kg_emb_dim
-            h = torch.zeros(len(all_ends), len(self._FIELDS) * d, device=self.device)
-            for k, f in enumerate(self._FIELDS):
-                edges, ends = per[f]
-                if not edges:
-                    continue
-                x0 = field_x0[f]
-                idx = torch.tensor([v for e in edges for v in e], dtype=torch.long, device=self.device)
-                seg = torch.tensor(
-                    [i for i, e in enumerate(edges) for _ in e], dtype=torch.long, device=self.device
-                )
-                cnt = torch.tensor([len(e) for e in edges], dtype=x0.dtype, device=self.device)
-                rep = x0.new_zeros(len(edges), d).index_add(0, seg, x0[idx]) / cnt.unsqueeze(-1)
-                rows = torch.tensor([row[e] for e in ends], dtype=torch.long, device=self.device)
-                h[:, k * d : (k + 1) * d] = h[:, k * d : (k + 1) * d].index_copy(0, rows, rep)
+            h = self._window_reps(per, all_ends, field_x0)
             alpha = self.retention_gate(h, h[-1], ages)
             q_age = ages[-1]
         if self.retention_shuffle and alpha.numel() > 1:
@@ -1050,6 +1056,90 @@ class HyCoRecModel(BaseModel):
         if self.record_attn:
             log = {"q_age": q_age, "windows": [[a, float(x)] for a, x in zip(ages, alpha.tolist())]}
         return out, log
+
+    def _window_reps(self, per, all_ends, field_x0):
+        """(len(all_ends), F*d): per-field mean x^(0) of each window (zeros where a field has none)."""
+        row = {e: i for i, e in enumerate(all_ends)}
+        d = self.kg_emb_dim
+        h = torch.zeros(len(all_ends), len(self._FIELDS) * d, device=self.device)
+        for k, f in enumerate(self._FIELDS):
+            edges, ends = per[f]
+            if not edges:
+                continue
+            x0 = field_x0[f]
+            idx = torch.tensor([v for e in edges for v in e], dtype=torch.long, device=self.device)
+            seg = torch.tensor(
+                [i for i, e in enumerate(edges) for _ in e], dtype=torch.long, device=self.device
+            )
+            cnt = torch.tensor([len(e) for e in edges], dtype=x0.dtype, device=self.device)
+            rep = x0.new_zeros(len(edges), d).index_add(0, seg, x0[idx]) / cnt.unsqueeze(-1)
+            rows = torch.tensor([row[e] for e in ends], dtype=torch.long, device=self.device)
+            h[:, k * d : (k + 1) * d] = h[:, k * d : (k + 1) * d].index_copy(0, rows, rep)
+        return h
+
+    def _evidence_retention(self, batch, b, per, all_ends, ages, field_x0):
+        """``retention: evidence``. Turn reps ``u_t`` and re-mention overlaps come from
+        ``context_turn_*`` (turns before the prediction only). Stores the readout score of every
+        window end in ``self._ret_score`` for ``_pool_relations``; the conv stays ungated, or is
+        muted entirely (interp gate at 0) when ``c_propagate`` is false."""
+        d = self.kg_emb_dim
+        turns = {f: batch[f"context_turn_{f}"][b] for f in self._FIELDS}
+        n_turns = len(turns["entity"])
+        u = torch.zeros(n_turns, len(self._FIELDS) * d, device=self.device)
+        for k, f in enumerate(self._FIELDS):
+            for t, nodes in enumerate(turns[f]):
+                if nodes:
+                    ids = torch.tensor(list(dict.fromkeys(nodes)), dtype=torch.long, device=self.device)
+                    u[t, k * d : (k + 1) * d] = field_x0[f][ids].mean(0)
+        nonempty = [t for t in range(n_turns) if any(turns[f][t] for f in self._FIELDS)]
+        q = u[nonempty[-1]] if nonempty else u[-1]
+        # window node sets per end (fields kept apart: word ids live in another index space)
+        win = {e: [set() for _ in self._FIELDS] for e in all_ends}
+        for k, f in enumerate(self._FIELDS):
+            for edge, e in zip(*per[f]):
+                win[e][k] = set(edge)
+        ov = torch.zeros(len(all_ends), n_turns, device=self.device)
+        for i, e in enumerate(all_ends):
+            size = sum(len(s) for s in win[e][: len(self._FIELDS)])
+            for t in range(e + 1, n_turns):
+                hit = sum(len(win[e][k] & set(turns[f][t])) for k, f in enumerate(self._FIELDS))
+                ov[i, t] = hit / max(1, size)
+        h = self._window_reps(per, all_ends, field_x0)
+        ends_t = torch.tensor(all_ends, dtype=torch.long, device=self.device)
+        score, log_rho = self.retention_gate(h, ends_t, u, ov, q=q)
+        self._ret_score = dict(zip(all_ends, score))
+        rho = log_rho.exp()
+        with torch.no_grad():
+            self.ret_alpha_lt005[0] += int((rho < 0.05).sum())
+            self.ret_alpha_lt005[1] += rho.numel()
+        out = {}
+        for f in per:
+            gate = None
+            if not self.c_propagate and per[f][0]:
+                gate = torch.zeros(len(per[f][0]), device=self.device)
+            out[f] = (per[f][0], per[f][1], gate)
+        log = None
+        if self.record_attn:
+            beta = torch.softmax(score.detach(), 0).tolist()
+            log = {"q_age": 0, "windows": [[a, float(r)] for a, r in zip(ages, rho.tolist())],
+                   "beta": beta}
+        return out, log
+
+    def _pool_relations(self, x, tot2sub, edges, ends):
+        """Relation readout: ``sum_e softmax_e(score_e) * mean_{v in e} x_v`` over this field's
+        windows (``score`` from ``_evidence_retention``). None if the field has no window."""
+        if x is None:
+            return None
+        reps, keep = [], []
+        for edge, e in zip(edges, ends):
+            rows = [tot2sub[v] for v in edge if v in tot2sub]
+            if rows:
+                reps.append(x[rows].mean(0))
+                keep.append(e)
+        if not reps:
+            return None
+        beta = torch.softmax(torch.stack([self._ret_score[e] for e in keep]), 0)
+        return (beta.unsqueeze(-1) * torch.stack(reps)).sum(0)
 
     def _gather_dense(self, xg, query_nodes):
         rows = sorted({v for v in query_nodes if 0 <= v < xg.size(0)})
@@ -1105,6 +1195,7 @@ class HyCoRecModel(BaseModel):
         for b in range(bsz):
             target = int(batch["item"][b]) if self.exclude_target and "item" in batch else None
             has_history = bool(batch["has_history"][b])
+            self._ret_score = {}  # filled per sample by _evidence_retention
             c_info, sample_ret = (
                 self._context_retention(batch, b, field_x0) if "C" in self.scopes else (None, None)
             )
@@ -1122,14 +1213,20 @@ class HyCoRecModel(BaseModel):
                 if "C" in self.scopes:
                     ctx_edges, _, gate = c_info[field]
                     self._node_w = None
+                    evidence = self.retention == "evidence" and c_info is not None
                     xc, mc = self._scope_hconv(
                         "C", ctx_edges, field, x0, exclude=target,
-                        edge_gate=gate, gate_conv=self.retention_apply == "both",
+                        edge_gate=gate, gate_conv=self.retention_apply == "both" or evidence,
                     )
-                    p_c = self._pool_local(
-                        xc, mc, readout, none_if_empty=rows7,
-                        node_w=self._node_w if gate is not None and self.retention != "const" else None,
-                    )
+                    if evidence and self._ret_score:
+                        p_c = self._pool_relations(xc, mc, ctx_edges, c_info[field][1])
+                        p_c = self._empty_row(rows7) if p_c is None else p_c
+                    else:
+                        p_c = self._pool_local(
+                            xc, mc, readout, none_if_empty=rows7,
+                            node_w=(self._node_w if gate is not None
+                                    and self.retention not in ("const", "evidence") else None),
+                        )
                 else:
                     p_c = self._empty_row(rows7)
 

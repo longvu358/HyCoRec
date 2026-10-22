@@ -366,3 +366,49 @@ def test_g_query_sets_and_rows():
     g = HyCoRecModel._gather_dense(None, xg, [1, 2, 2])
     assert torch.allclose(row([], [g]), xg[[1, 2]].mean(0))  # duplicates counted once
     assert row([], []) is None  # empty Q^G -> row dropped from the key set
+
+
+# --------------------------------------------------------------------------
+# evidence retention (forget gate per later turn + relevance)
+# --------------------------------------------------------------------------
+def _evidence_inputs(m=4, n_turns=5, d=6, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    h, u = torch.randn(m, d, generator=g), torch.randn(n_turns, d, generator=g)
+    ends = torch.tensor([0, 1, 3, 4])
+    ov = torch.rand(m, n_turns, generator=g)
+    return h, ends, u, ov
+
+
+def test_evidence_retention_special_cases():
+    from crslab.model.crs.hycorec.cpc import EvidenceRetention
+
+    h, ends, u, ov = _evidence_inputs()
+    ages = (u.size(0) - 1 - ends).float()
+    none = EvidenceRetention(2, n_fields=3, forget="none", relevance=False)
+    score, log_rho = none(h, ends, u, ov)
+    assert torch.equal(score, torch.zeros(4))  # softmax -> plain mean over relations
+    const = EvidenceRetention(2, n_fields=3, forget="const", relevance=False, gamma=0.7)
+    _, log_rho = const(h, ends, u, ov)
+    assert torch.allclose(log_rho.exp(), 0.7 ** ages, atol=1e-6)  # rho = gamma ** age
+    for forget in ("evidence", "age"):
+        mod = EvidenceRetention(2, n_fields=3, forget=forget)
+        score, log_rho = mod(h, ends, u, ov)
+        assert log_rho[-1] == 0  # latest window: empty product, rho = 1 (anchor)
+        assert torch.all(log_rho <= 0)
+        assert torch.allclose(score, log_rho)  # W_k starts at 0: no relevance term at init
+        # at init every later turn forgets sigmoid(-4); older relations are discounted more
+        assert torch.allclose(log_rho, ages * torch.nn.functional.logsigmoid(torch.tensor(4.0)), atol=1e-6)
+
+
+def test_evidence_retention_depends_only_on_later_turns():
+    from crslab.model.crs.hycorec.cpc import EvidenceRetention
+
+    h, ends, u, ov = _evidence_inputs()
+    mod = EvidenceRetention(2, n_fields=3, forget="evidence", relevance=False)
+    torch.nn.init.normal_(mod.mlp[2].weight)
+    _, a = mod(h, ends, u, ov)
+    u2, ov2 = u.clone(), ov.clone()
+    u2[:2], ov2[:, :2] = torch.randn(2, u.size(1)), 0.5  # turns 0-1 precede every window but the first two
+    _, b = mod(h, ends, u2, ov2)
+    assert torch.allclose(a[2:], b[2:])  # windows ending at turn >= 1 never read turns <= their end
+    assert not torch.allclose(a[0], b[0])  # window ending at 0 does see turn 1

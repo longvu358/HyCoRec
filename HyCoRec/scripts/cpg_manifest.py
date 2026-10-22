@@ -136,6 +136,22 @@ for _g in (1.0, 0.95, 0.85, 0.7, 0.5):
         "extra-S12", {"window_dedupe": True, "retention": "fixed", "retention_gamma": _g}, prio=2,
         note=f"Fixed temporal decay gamma={_g}")
 
+# extra-S12 / round 3 mechanism: evidence-driven retention on a relation-level readout (cpc.EvidenceRetention).
+# Score_e = relevance(u_T, h_e) + log rho_e, rho_e = prod over later turns of (1 - forget); conv never gated.
+# Each row drops one component of r3_evidence (the ladder of RQ2).
+_EV = {"window_dedupe": True, "retention": "evidence"}
+for _n, _o, _note in (
+    ("r3_rel_uniform", {"retention_forget": "none", "retention_relevance": False}, "relation readout, plain mean"),
+    ("r3_rel_fixed", {"retention_forget": "const", "retention_gamma": 0.7, "retention_relevance": False},
+     "relation readout, rho = 0.7^age"),
+    ("r3_rel_attn", {"retention_forget": "none"}, "relevance to the current turn only, no retention"),
+    ("r3_age", {"retention_forget": "age"}, "relevance + one learned per-turn forget rate"),
+    ("r3_evidence", {}, "relevance + evidence forget gate (content of later turns + re-mention overlap)"),
+    ("r3_evidence_noov", {"retention_overlap": False}, "r3_evidence without the re-mention overlap feature"),
+    ("r3_evidence_noprop", {"c_propagate": False}, "r3_evidence with scope C not propagating (as r2_c_noprop)"),
+):
+    CELLS[_n] = _cell("extra-S12", {**_EV, **_o}, prio=1, ckpt=True, rec_only=True, note=_note)
+
 # extra-S13: composition of the user-side G query Q^G (Q^P is ~93% of readout + Q^P). Baseline = r2_uniform
 # (same overrides, g_query ctx+hist). The candidate-side X^G term (ei_mode xg) is untouched by these cells.
 for _q, _note in (("ctx", "r^G from the dialogue readout only"), ("hist", "r^G from Q^P only"),

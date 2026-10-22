@@ -115,6 +115,53 @@ Tất cả dùng `hconv_dropout: 0.3`, `window_dedupe`, rec-only. Baseline `r2_u
 - Mọi Δ ≤ .0007, trong khi std giữa các seed của `full` TG là khoảng .003 R@10. Việc g_q_hist trùng uniform đến 4 chữ số cho thấy ở TG, hàng G phía user gần như không được dùng.
 - Số TG ở công thức này (.020–.028) thấp hơn MHIM (.031) và HyCoRec* (.0377); valid rec_loss tăng 10.6 → 18.7. Công thức TG cần xử lý riêng trước khi so các biến thể nhỏ.
 
+### Dump α của `r2_rescope_ip`, dropout 0.3, seed 3407 (ckpt 20261022-021023, `analyze --force`)
+- α mean .0094, std .0214; 97.2% < .05; trung vị .0027. Theo tuổi: tuổi 0 .030, tuổi 1 .006, tuổi 2 .012, tuổi ≥3 ≤ .003; corr(tuổi, α) −.33.
+  Std trong mẫu .012 so với std giữa các mẫu .013. Vẫn sập giống vòng 2 (dump trước đó là file của dropout 0.2).
+- Hệ quả: ở propagation, C của ip gần như không propagate (≥97% message bị tắt, node giữ lin(x)+b).
+  Ở readout, trọng số max-α được chuẩn hoá `/Σw`, nên **tỉ lệ** mới là cái có tác dụng: node ở window tuổi 0 nặng khoảng 10× node tuổi ≥3,
+  tức readout C của ip là một trọng số recency rất gắt dù α tuyệt đối gần 0.
+- Vậy ip = (C không propagate) + (readout C nghiêng mạnh về turn gần nhất). `r2_c_noprop` chỉ tách được thành phần thứ nhất
+  (readout của nó không gán trọng số). Nếu noprop < ip, thành phần thứ hai cần thêm một đối chứng cố định: α=0 ở conv + readout γ^tuổi.
+
+## Vòng 6 — thiết kế lại cơ chế: retention dựa trên bằng chứng (`retention: evidence`, cell `r3_*`)
+### Vì sao cơ chế cũ không hợp lý (lỗi cấu trúc, không chỉ số liệu)
+- α được tính lại từ đầu ở mỗi turn, chỉ từ nội dung window và tuổi; nó không biết gì về **các turn đến sau** window (nhắc lại, chuyển chủ đề),
+  nên chỉ có thể là một hàm của độ gần.
+- α gate conv trên các window chồng lấn (w=3): tác dụng của nó khó xác định, và nó phải gánh luôn việc "conv ở C có hại", nên sập về 0.
+- Readout dùng max α trên các window chứa node, tức α của window trẻ nhất; retention bị thu về tuổi của node, mất cấu trúc relation.
+- σ độc lập rồi chuẩn hoá /Σw: không có mốc, nên α trôi thành hệ số thang theo mẫu.
+
+### Phân tích tiền nghiệm (không train): `scripts/extra/evidence_probe.py <ds>`, fit trên valid, đánh giá trên test
+Nhãn utility u_e = target ∈ e hoặc nối 1-hop với node của e trong Â^G. Đo bằng AUC ghép cặp **trong cùng mẫu**, tức đúng loại tín hiệu
+mà softmax trên các window khai thác được.
+
+| scorer | hredial | htgredial |
+|---|---|---|
+| recency (−tuổi) | .653 | .748 |
+| số lần nhắc lại | .605 | .735 |
+| rel_now (liên quan đến turn hiện tại) | **.747** | **.779** |
+| LR tuổi + kích thước + có item | .706 | .769 |
+| LR toàn bộ bằng chứng | **.786** | **.795** |
+| LR bằng chứng, bỏ rel_now | .730 | .771 |
+| số mẫu có nhãn lẫn (nơi việc chọn window có tác dụng) | 550/3118 (18%) | 1154/2833 (41%) |
+
+- Tín hiệu vượt quá tuổi là có thật. Thành phần mạnh nhất là **liên quan đến turn hiện tại** (→ số hạng relevance với q = u_T).
+- **Nhắc lại làm relation không phai** (→ forget gate có đặc trưng overlap): ở TG, P(u) của window tuổi ≥7 là .154 nếu không được nhắc lại, .475 nếu được nhắc lại
+  (cao ngang window tuổi 1 không được nhắc lại, .396). ReDial cùng chiều nhưng yếu hơn.
+- Role (seeker_share) yếu. Trần lợi ích ở ReDial nhỏ (chỉ 18% mẫu có nhãn lẫn); TG có không gian lớn hơn.
+- Cảnh báo: nhãn dùng chung Â^G với rel_now/cont_later nên AUC có thể bị thổi phồng; nhãn 1-hop khá lỏng (P(u) = .61 ở ReDial).
+  Bài học từ vòng 4: proxy chỉ chỉ ra hướng, không đo được độ lớn.
+
+### Cơ chế mới (cpc.EvidenceRetention)
+- Đơn vị là relation: r_e^f = mean các node của e sau conv; conv ở C **không bị gate** (`c_propagate: false` thì C chỉ còn lin(x)+b).
+- f_{e,t} = σ(MLP([h_e; u_t; h_e⊙u_t; ov(e,t)]) − 4) cho mỗi turn t > t_e; log ρ_e = Σ log(1 − f_{e,t}). Window mới nhất có ρ = 1 (mốc).
+- β_e = softmax_e((W_q u_T)·(W_k h_e)/√d + log ρ_e); c^C_f = Σ_e β_e r_e^f. Khởi tạo trung tính: W_k = 0, mỗi turn quên khoảng .018.
+- Thang ablation (mỗi cell bỏ đúng một thành phần): `r3_rel_uniform` (mean trên relation) → `r3_rel_fixed` (ρ = .7^tuổi) → `r3_rel_attn`
+  (chỉ relevance) → `r3_age` (relevance + tốc độ quên học được) → **`r3_evidence`**; thêm `r3_evidence_noov`, `r3_evidence_noprop`.
+- Kiểm tra: test `test_evidence_retention_special_cases` (none = mean, const = γ^tuổi, mốc ρ=1, khởi tạo trung tính) và
+  `test_evidence_retention_depends_only_on_later_turns`; gradient tới cả hai nhánh sau bước đầu; smoke 1% dữ liệu chạy được (khoảng 2.7 phút, so với 1.9 của uniform).
+
 ## Ghi chú vận hành
 - Máy local 7 GB RAM: full hredial gần hết bộ nhớ; chạy tuần tự. Remote dùng `config` khác local (lr 0.0005, wd 0.1, clip 1).
 - Config `r2_*` sinh bằng `python scripts/run_cpg.py gen` (không commit).
