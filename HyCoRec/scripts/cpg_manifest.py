@@ -129,6 +129,23 @@ CELLS.update({
                                        "retention_gate_mode": "interp"}, prio=1, ckpt=True, rec_only=True,
                          note="control: interp gate, alpha = 0 (scope C without hyperedge propagation)"),
 })
+# ReSCOPE v2 (= r2_rescope_ip, the paper model) and its fixed-decay baseline on the same interp gate:
+# alpha = 1 (r2_uniform) | 0.75^age fixed | learned from that prior | 0 (r2_c_noprop).
+_IP = {"window_dedupe": True, "retention": "learned", "retention_gate_mode": "interp",
+       "retention_prior": "decay", "retention_gamma": 0.75}
+CELLS.update({
+    "r2_ip_fixed": _cell("extra-S12", {"window_dedupe": True, "retention": "fixed", "retention_gamma": 0.75,
+                                       "retention_gate_mode": "interp"}, prio=1, ckpt=True,
+                         note="ReSCOPE v2 w/o learning: alpha frozen at its prior 0.75^age (interp gate)"),
+    # RQ1: the paper model (ReSCOPE v2 on C+P+G) with the generation stage; RQ3: its scope subsets
+    "rescope_full": _cell("RQ1", _IP, rec_only=False, ckpt=True, note="ReSCOPE v2, C+P+G, rec + conv"),
+    "rq3_C": _cell("RQ3", {**_IP, "scopes": ["C"], "collective_path": None, "use_review_hypergraph": False,
+                           "ei_mode": "base"}, ckpt=True, note="ReSCOPE v2, C only"),
+    "rq3_CP": _cell("RQ3", {**_IP, "scopes": ["C", "P"], "collective_path": None, "ei_mode": "base"},
+                    ckpt=True, note="ReSCOPE v2, C + P"),
+    "rq3_CG": _cell("RQ3", {**_IP, "scopes": ["C", "G"], "use_review_hypergraph": False}, ckpt=True,
+                    note="ReSCOPE v2, C + G (C+P+G = r2_rescope_ip)"),
+})
 # Fixed temporal decay alpha = gamma^age; gamma tuned on valid with the same budget as the other variants.
 # gamma = 1 must reproduce r2_uniform (sanity); small gamma approaches Latest-only.
 for _g in (1.0, 0.95, 0.85, 0.7, 0.5):

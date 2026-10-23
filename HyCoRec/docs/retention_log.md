@@ -75,6 +75,10 @@ Lưu ý: cả hai run dùng `hconv_dropout: 0.3` (commit 218bae2); các run vòn
 - Phép thử tuyến tính không cần train (proxy wᵀÂ^G) cho cùng kết luận: decay trên phần ngữ cảnh chỉ thêm khoảng +0.3–1 điểm R@10. Trong khi đó, truy vấn G (`readout + q_p`) gồm khoảng 93% node history; trộn history với trọng số 1 làm proxy R@10 giảm từ .219 xuống .102 (ReDial) và từ .080 xuống .001 (TG).
 - Hệ quả: retention ở scope C hiện không tạo chênh lệch đo được. Nên ưu tiên sửa cách tạo truy vấn G (tách context và history) trước khi đưa α sang G.
 
+> **Đính chính (2026-10-23):** các run vòng 4–5 (log/20261022-021023, -021049, -142619) dùng `hconv_dropout: 0.2`, không phải 0.3 như ghi bên dưới.
+> Riêng `r2_uniform` seed 3407 (log/20261021-222655, vòng 3) dùng 0.3. Vì vậy mọi Δ ở seed 3407 trong vòng 4–5 so với uniform đều lệch cấu hình,
+> và các trung bình 3 seed của uniform lẫn hai cấu hình. Các Δ ghép cặp ở seed 42/123 vẫn hợp lệ. Chi tiết: `docs/r3_results_hredial.md` mục 3.3 và 6.
+
 ## Vòng 4 — thành phần truy vấn G (`g_query`, extra-S13) + `r2_rescope_ip` với dropout 0.3 (hredial, log/20261022-021023, -021049)
 Tất cả dùng `hconv_dropout: 0.3`, `window_dedupe`, rec-only. Baseline `r2_uniform` có 3 seed (3407 lấy từ log/20261021-222655).
 Δ là chênh lệch ghép cặp theo seed so với `r2_uniform`.
@@ -161,6 +165,35 @@ mà softmax trên các window khai thác được.
   (chỉ relevance) → `r3_age` (relevance + tốc độ quên học được) → **`r3_evidence`**; thêm `r3_evidence_noov`, `r3_evidence_noprop`.
 - Kiểm tra: test `test_evidence_retention_special_cases` (none = mean, const = γ^tuổi, mốc ρ=1, khởi tạo trung tính) và
   `test_evidence_retention_depends_only_on_later_turns`; gradient tới cả hai nhánh sau bước đầu; smoke 1% dữ liệu chạy được (khoảng 2.7 phút, so với 1.9 của uniform).
+
+## Vòng 7 — kết quả thang `r3_*` + `r2_c_noprop` (hredial, seed 3407, log/20261022-234858)
+Δ so với `r2_uniform` seed 3407 (R@1 .0265, R@10 .1692, R@50 .3537, MRR@10 .0624, NDCG@10 .0872). Std 3 seed của uniform: R@1 .0024, R@10 .0023, MRR .0016.
+
+| cell | R@1 | R@10 | R@50 | MRR@10 | NDCG@10 | phút/epoch (4 job song song) |
+|---|---|---|---|---|---|---|
+| r3_rel_uniform | .0272 (+.0007) | .1696 (+.0004) | .3468 (−.0069) | .0626 (+.0002) | .0875 | ~26 |
+| r3_rel_fixed (γ=.7) | .0274 (+.0009) | .1686 (−.0006) | .3489 (−.0048) | .0626 (+.0002) | .0872 | |
+| r3_rel_attn | .0299 (+.0034) | .1703 (+.0011) | .3535 | .0646 (+.0022) | .0891 (+.0019) | |
+| r3_age | .0299 | .1705 | .3535 | .0646 | .0892 | |
+| r3_evidence | .0297 (+.0032) | .1715 (+.0023) | .3539 | .0642 (+.0018) | .0891 | ~28 |
+| r3_evidence_noov | .0299 | .1715 | .3520 | .0654 (+.0030) | .0902 | |
+| r3_evidence_noprop | .0307 (+.0042) | .1700 | .3537 | .0652 (+.0028) | .0896 | ~30 |
+| r2_c_noprop (interp, α≡0) | .0290 (+.0025) | .1711 (+.0019) | .3570 (+.0033) | .0650 (+.0026) | .0897 (+.0025) | ~23 |
+| *r2_rescope_ip (vòng 4)* | *.0324 (+.0058)* | *.1700* | *.3537* | *.0671 (+.0047)* | *.0910 (+.0038)* | ~27 |
+
+Dump ρ của `r3_evidence` (`ret_alpha.py`): ρ trung bình theo tuổi 1.00 / .057 / .012 / .003 / ≤.003 (tuổi 0…4), từ tuổi 8 trở đi = 0.
+77% window có ρ < .05. Forget gate học quên khoảng 94% mỗi turn đến sau, tức gần như **chỉ giữ window mới nhất**.
+
+- **Retention không đóng góp**: `r3_age` trùng `r3_rel_attn` đến 4 chữ số (tốc độ quên học được gần như không rời khởi tạo), còn `r3_evidence`
+  quên gần hết mà vẫn ngang `r3_rel_attn` (chênh ≤ .0012, trong nhiễu 1 seed). Hai chế độ retention trái ngược nhau cho cùng kết quả, nên
+  ở ReDial **việc chọn window cũ nào để giữ không ảnh hưởng metric**. `noov` ≈ `evidence`: đặc trưng nhắc lại không được dùng.
+- **Relevance là thành phần duy nhất có dấu hiệu**: rel_attn − rel_uniform = +.0027 R@1, +.0020 MRR (khoảng 1 std, 1 seed).
+- **Bỏ propagation ở C có ích, tự nó**: `r2_c_noprop` +.0025 R@1, +.0026 MRR, và là cell duy nhất tăng R@50 (+.0033). Kết hợp với vòng 4–5:
+  phần lớn lợi ích đầu bảng của `ip` đến từ "C không propagate" + readout dồn về turn gần nhất, không phải từ retention.
+  `ip` (.0324) vẫn cao hơn mọi cell r3 (cao nhất .0307), nhưng cần seed 42/123 của r3 mới nói được.
+- Readout theo relation với mean (`rel_uniform`, `rel_fixed`) làm giảm R@50 khoảng .005–.007 so với readout theo node của uniform.
+- Khớp với phân tích tiền nghiệm: chỉ 18% mẫu ReDial có nhãn lẫn, nên trần lợi ích của việc chọn window là nhỏ. Nếu retention có tác dụng, nơi thử là TG
+  (41% mẫu có nhãn lẫn, hiệu ứng nhắc lại mạnh), nhưng phải sửa công thức TG trước.
 
 ## Ghi chú vận hành
 - Máy local 7 GB RAM: full hredial gần hết bộ nhớ; chạy tuần tự. Remote dùng `config` khác local (lr 0.0005, wd 0.1, clip 1).
