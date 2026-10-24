@@ -1,0 +1,277 @@
+{
+ "constants": {
+  "POS_THRESHOLD": 0.05,
+  "MIN_REVIEW_WORDS": 5,
+  "MAX_PHRASE_WORDS": 8,
+  "MIN_SURFACE_CHARS": 4,
+  "POS_STAR": 4,
+  "ZH_MIN_COMMENT_CHARS": 5,
+  "ZH_MIN_SURFACE_CHARS": 2,
+  "ZH_MAX_PHRASE_CHARS": 12
+ },
+ "hredial": {
+  "index": {
+   "E_top_size": {
+    "n": 1634,
+    "min": 1,
+    "p10": 1,
+    "median": 7,
+    "mean": 6.16,
+    "p90": 10,
+    "max": 10
+   },
+   "tf_of_kept_entities": {
+    "n": 10066,
+    "min": 1,
+    "p10": 1,
+    "median": 3,
+    "mean": 7.17,
+    "p90": 18,
+    "max": 327
+   },
+   "n_aspects_candidate": 4288,
+   "n_aspects_df_ge_m_min": 875,
+   "df_of_candidates": {
+    "n": 4288,
+    "min": 1,
+    "p10": 1,
+    "median": 1,
+    "mean": 2.35,
+    "p90": 4,
+    "max": 402
+   },
+   "aspect_hyperedge_size_before_cap": {
+    "n": 875,
+    "min": 3,
+    "p10": 3,
+    "median": 4,
+    "mean": 6.81,
+    "p90": 11,
+    "max": 402
+   },
+   "n_aspects_truncated_by_k_asp": 6,
+   "n_truncations_with_tie_at_cutoff": 6
+  },
+  "raw_index_stats": {
+   "dataset": "hredial",
+   "k_rev": 10,
+   "rank_by": "tf",
+   "n_items_with_review_text": 5397,
+   "n_reviews_used": 56401,
+   "n_sentences_total": 588674,
+   "n_sentences_positive": 284680,
+   "n_positive_sentences_with_a_linked_entity": 61392,
+   "n_items_with_E_top_nonempty": 1634,
+   "pct_items_with_E_top_nonempty": 30.3,
+   "E_top_size": {
+    "min": 1,
+    "max": 10,
+    "mean": 6.16
+   }
+  },
+  "text": {
+   "reviews_per_item_used": {
+    "n": 5397,
+    "min": 0,
+    "p10": 0,
+    "median": 0,
+    "mean": 10.45,
+    "p90": 30,
+    "max": 100
+   },
+   "n_items_with_>=1_review": 2101,
+   "review_len_words": {
+    "n": 56401,
+    "min": 5,
+    "p10": 49,
+    "median": 160,
+    "mean": 217.57,
+    "p90": 460,
+    "max": 1869
+   },
+   "sentence_len_tokens": {
+    "n": 588674,
+    "min": 0,
+    "p10": 6,
+    "median": 18,
+    "mean": 21.59,
+    "p90": 41,
+    "max": 1137
+   },
+   "exact_duplicate_reviews_within_item": 950
+  },
+  "collective_full": {
+   "n_train_conversations": 9062,
+   "tokenize": "nltk",
+   "with_review": true,
+   "with_aspect": true,
+   "no_dialogue": false,
+   "fields": {
+    "item": {
+     "n_hyperedges": 9934,
+     "n_dialogue_hyperedges": 9059,
+     "n_review_or_aspect_hyperedges": 875,
+     "n_nodes": 33995,
+     "a_hat_nnz": 210457,
+     "edge_size_min": 2,
+     "edge_size_max": 50,
+     "edge_size_mean": 5.25
+    },
+    "entity": {
+     "n_hyperedges": 10694,
+     "n_dialogue_hyperedges": 9060,
+     "n_review_or_aspect_hyperedges": 1634,
+     "n_nodes": 33995,
+     "a_hat_nnz": 331076,
+     "edge_size_min": 2,
+     "edge_size_max": 22,
+     "edge_size_mean": 6.47
+    },
+    "word": {
+     "n_hyperedges": 9062,
+     "n_dialogue_hyperedges": 9062,
+     "n_review_or_aspect_hyperedges": 0,
+     "n_nodes": 27297,
+     "a_hat_nnz": 10181500,
+     "edge_size_min": 9,
+     "edge_size_max": 263,
+     "edge_size_mean": 85.87
+    }
+   },
+   "tail": {
+    "n_items": 6515,
+    "n_head": 1303,
+    "n_tail": 5212,
+    "n_tail_unseen_in_train": 932,
+    "n_tail_saved_by_review": 235
+   }
+  }
+ },
+ "htgredial": {
+  "index": {
+   "E_top_size": {
+    "n": 8358,
+    "min": 2,
+    "p10": 10,
+    "median": 10,
+    "mean": 10.0,
+    "p90": 10,
+    "max": 10
+   },
+   "tf_of_kept_entities": {
+    "n": 83551,
+    "min": 1,
+    "p10": 2,
+    "median": 8,
+    "mean": 15.92,
+    "p90": 37,
+    "max": 488
+   },
+   "n_aspects_candidate": 9540,
+   "n_aspects_df_ge_m_min": 5053,
+   "df_of_candidates": {
+    "n": 9540,
+    "min": 1,
+    "p10": 1,
+    "median": 3,
+    "mean": 8.76,
+    "p90": 18,
+    "max": 680
+   },
+   "aspect_hyperedge_size_before_cap": {
+    "n": 5053,
+    "min": 3,
+    "p10": 3,
+    "median": 7,
+    "mean": 15.33,
+    "p90": 32,
+    "max": 680
+   },
+   "n_aspects_truncated_by_k_asp": 273,
+   "n_truncations_with_tie_at_cutoff": 190
+  },
+  "raw_index_stats": {
+   "dataset": "htgredial",
+   "k_rev": 10,
+   "rank_by": "tf*idf",
+   "n_items_with_review_text": 8361,
+   "n_reviews_used": 7883354,
+   "n_sentences_total": 7883354,
+   "n_sentences_positive": 3234629,
+   "n_positive_sentences_with_a_linked_entity": 2083579,
+   "pos_star": 4,
+   "n_items_with_E_top_nonempty": 8358,
+   "pct_items_with_E_top_nonempty": 100.0,
+   "E_top_size": {
+    "min": 2,
+    "max": 10,
+    "mean": 10.0
+   }
+  },
+  "text": {
+   "comments_per_item_used": {
+    "n": 8361,
+    "min": 36,
+    "p10": 376,
+    "median": 1008,
+    "mean": 942.87,
+    "p90": 1416,
+    "max": 3000
+   },
+   "comment_len_chars": {
+    "n": 7883354,
+    "min": 5,
+    "p10": 8,
+    "median": 23,
+    "mean": 38.54,
+    "p90": 96,
+    "max": 4247
+   }
+  },
+  "collective_full": {
+   "n_train_conversations": 8001,
+   "tokenize": "pkuseg",
+   "with_review": true,
+   "with_aspect": true,
+   "fields": {
+    "item": {
+     "n_hyperedges": 13054,
+     "n_dialogue_hyperedges": 8001,
+     "n_review_or_aspect_hyperedges": 5053,
+     "n_nodes": 62288,
+     "a_hat_nnz": 1451818,
+     "edge_size_min": 2,
+     "edge_size_max": 50,
+     "edge_size_mean": 6.56
+    },
+    "entity": {
+     "n_hyperedges": 16359,
+     "n_dialogue_hyperedges": 8001,
+     "n_review_or_aspect_hyperedges": 8358,
+     "n_nodes": 62288,
+     "a_hat_nnz": 1627951,
+     "edge_size_min": 3,
+     "edge_size_max": 27,
+     "edge_size_mean": 11.55
+    },
+    "word": {
+     "n_hyperedges": 8001,
+     "n_dialogue_hyperedges": 8001,
+     "n_review_or_aspect_hyperedges": 0,
+     "n_nodes": 30001,
+     "a_hat_nnz": 21356328,
+     "edge_size_min": 74,
+     "edge_size_max": 244,
+     "edge_size_mean": 124.74
+    }
+   },
+   "tail": {
+    "n_items": 33531,
+    "n_head": 6706,
+    "n_tail": 26825,
+    "n_tail_unseen_in_train": 22712,
+    "n_tail_saved_by_review": 3211
+   }
+  }
+ }
+}
